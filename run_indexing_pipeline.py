@@ -2,6 +2,7 @@ from prep_warc_files import warc_to_html, warc_to_pdf
 import os
 from combine_domains import combine_domains_by_timestamp
 from html_combined_to_markdown import convert_html_combined_to_markdown
+from pdf_combined_to_markdown import convert_pdf_combined_to_markdown
 from index_to_elasticsearch import index_markdown_to_elasticsearch
 import shutil
 from dotenv import load_dotenv
@@ -40,11 +41,29 @@ for coll in coll_list:
     print(f"Total files: {result['total_files']}")
     print(f"Domains: {result['domains']}")
 
+
     result = convert_html_combined_to_markdown(
         input_dir="output/html_combined/"+coll,
         output_dir="output/markdown/"+coll,
         excel_path="data/2025-11-20_19945_topics.xlsx",
         mappings_path="output/mappings/"+coll+"/domain_mappings.json"
+    )
+
+    result = combine_domains_by_timestamp(
+        input_dir="output/pdf_raw/"+coll,
+        output_dir="output/pdf_combined/"+coll,
+        timestamps_json_path="output/mappings/"+coll+"/timestamps.json"
+    )
+
+    print(f"Processed {result['domains_count']} domains")
+    print(f"Total files: {result['total_files']}")
+    print(f"Domains: {result['domains']}")
+
+    result = convert_pdf_combined_to_markdown(
+        input_dir="output/pdf_combined/"+coll,
+        output_dir="output/markdown/"+coll,  # Same output dir as HTML markdown
+        excel_path="data/2025-11-20_19945_topics.xlsx",
+        mappings_path="output/mappings/"+coll+"/pdf_domain_mappings.json"
     )
 
     index_markdown_to_elasticsearch(
