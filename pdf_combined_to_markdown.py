@@ -181,7 +181,7 @@ def process_single_pdf_file(args):
         return ('skipped', 1)
 
 
-def process_domain_parallel(domain_folder, input_path, output_path, allowed_domains, filenames_to_remove, max_workers=16):
+def process_domain_parallel(domain_folder, input_path, output_path, allowed_domains, filenames_to_remove, max_workers=None):
     """
     Process all PDF files in a domain folder in parallel.
 
@@ -191,7 +191,7 @@ def process_domain_parallel(domain_folder, input_path, output_path, allowed_doma
         output_path (Path): Output base path
         allowed_domains (set): Set of allowed domains (or None)
         filenames_to_remove (list): Keywords to skip
-        max_workers (int): Number of thread workers for file I/O
+        max_workers (int, optional): Number of thread workers for file I/O. If None, uses CPU count.
 
     Returns:
         dict: Results with 'domain', 'converted', 'skipped' counts
@@ -220,8 +220,11 @@ def process_domain_parallel(domain_folder, input_path, output_path, allowed_doma
     converted = 0
     skipped = 0
 
+    # Determine number of workers for files within this domain
+    file_workers = max_workers if max_workers is not None else mp.cpu_count()
+
     # Process files in parallel using threads (I/O bound)
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    with ThreadPoolExecutor(max_workers=file_workers) as executor:
         for status, count in executor.map(process_single_pdf_file, file_args):
             if status == 'converted':
                 converted += count
@@ -241,7 +244,7 @@ def convert_pdf_combined_to_markdown(
         "imprint", "data-protection", "contact", "copyright",
     ],
     max_domain_workers=None,
-    max_file_workers=16
+    max_file_workers=None
 ):
     """
     Convert PDF files from pdf_combined directory to markdown files.
@@ -255,7 +258,7 @@ def convert_pdf_combined_to_markdown(
         mappings_path (str, optional): Path to save domain->URL mappings JSON file
         filenames_to_remove (list): Keywords that if found in filename, file is skipped
         max_domain_workers (int, optional): Max parallel domains. If None, uses CPU count.
-        max_file_workers (int): Max parallel files per domain (default: 16)
+        max_file_workers (int, optional): Max parallel files per domain. If None, uses CPU count.
 
     Returns:
         dict: Summary with 'domains_processed', 'files_converted', 'files_skipped'
