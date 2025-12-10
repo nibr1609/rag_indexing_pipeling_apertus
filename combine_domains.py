@@ -13,6 +13,8 @@ from datetime import datetime
 from collections import defaultdict
 import json
 import pandas as pd
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import cpu_count
 
 
 def extract_timestamp_and_domain(folder_name):
@@ -205,7 +207,19 @@ def combine_domain_folders(domain, folder_list, output_dir):
     return len(file_registry), timestamp_metadata
 
 
-def combine_domains_by_timestamp(input_dir, output_dir, timestamps_json_path=None, excel_path=None):
+def _process_domain_worker(args):
+    """
+    Worker function for parallel domain processing.
+    Accepts a tuple of (domain, folder_list, output_dir) and returns results.
+    """
+    domain, folder_list, output_dir = args
+    # Sort by timestamp (None values go first)
+    folder_list.sort(key=lambda x: x[0] if x[0] is not None else datetime.min)
+    files_count, timestamp_metadata = combine_domain_folders(domain, folder_list, output_dir)
+    return domain, files_count, timestamp_metadata
+
+
+def combine_domains_by_timestamp(input_dir, output_dir, timestamps_json_path=None, excel_path=None, max_workers=None):
     """
     Combine HTML files from multiple WARC extractions by domain.
     For files that exist in multiple folders (same domain, same path),
@@ -218,6 +232,7 @@ def combine_domains_by_timestamp(input_dir, output_dir, timestamps_json_path=Non
             If None, saves to "{output_dir}_timestamps.json"
         excel_path (str, optional): Path to Excel file with URL column to filter domains.
             If None, processes all domains.
+        max_workers (int, optional): Maximum number of parallel workers. If None, uses min(cpu_count(), 8).
 
     Returns:
         dict: Summary with keys 'domains_count', 'total_files', 'domains', and 'timestamps_file'
@@ -249,21 +264,38 @@ def combine_domains_by_timestamp(input_dir, output_dir, timestamps_json_path=Non
         }
 
     print(f"\n\nFound {len(domain_folders)} unique domains")
+
+    # Determine worker count (avoid too many workers for I/O-bound tasks)
+    if max_workers is None:
+        max_workers = min(cpu_count(), 8)
+
+    print(f"Using {max_workers} parallel workers")
     print("=" * 70)
 
-    # Process each domain
+    # Process domains in parallel
     total_files = 0
     processed_domains = []
     all_timestamps = {}
 
-    for domain, folder_list in sorted(domain_folders.items()):
-        # Sort by timestamp (None values go first)
-        folder_list.sort(key=lambda x: x[0] if x[0] is not None else datetime.min)
+    # Prepare work items for parallel processing
+    work_items = [(domain, folder_list, output_dir) for domain, folder_list in sorted(domain_folders.items())]
 
-        files_count, timestamp_metadata = combine_domain_folders(domain, folder_list, output_dir)
-        total_files += files_count
-        processed_domains.append(domain)
-        all_timestamps.update(timestamp_metadata)
+    # Use ProcessPoolExecutor for parallel processing
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        futures = {executor.submit(_process_domain_worker, work_item): work_item[0]
+                   for work_item in work_items}
+
+        # Collect results as they complete
+        for future in as_completed(futures):
+            domain = futures[future]
+            try:
+                domain, files_count, timestamp_metadata = future.result()
+                total_files += files_count
+                processed_domains.append(domain)
+                all_timestamps.update(timestamp_metadata)
+            except Exception as e:
+                print(f"Error processing domain {domain}: {e}")
 
     # Save timestamp metadata to JSON
     if timestamps_json_path is None:
