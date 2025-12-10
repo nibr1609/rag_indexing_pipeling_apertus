@@ -7,6 +7,7 @@ from pdf_combined_to_markdown import convert_pdf_combined_to_markdown
 from index_to_elasticsearch import index_markdown_to_elasticsearch
 import shutil
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 load_dotenv()
 
@@ -24,7 +25,7 @@ def main():
     )
 
     parser.add_argument(
-        '--filter-excel-path',
+        '--topics-excel-path',
         required=True
     )
 
@@ -67,37 +68,65 @@ def main():
 
 
     # -------------------
-    # Processing Pipeline
-    # ------------------- 
+    # Processing Pipeline (Parallelized)
+    # -------------------
 
-    warc_to_html(warc_input_dir, html_raw_dir)
-    warc_to_pdf(warc_input_dir, pdf_raw_dir)
+    print("\n" + "=" * 70)
+    print("STAGE 1: WARC Extraction (HTML and PDF in parallel)")
+    print("=" * 70)
 
-    combine_domains_by_timestamp(
-        input_dir=html_raw_dir,
-        output_dir=html_combined_dir,
-        timestamps_json_path=timestamps_json_path
-    )
+    # OPTIMIZATION 2: Run HTML and PDF WARC extraction in parallel
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        html_future = executor.submit(warc_to_html, warc_input_dir, html_raw_dir)
+        pdf_future = executor.submit(warc_to_pdf, warc_input_dir, pdf_raw_dir)
 
-    convert_html_combined_to_markdown(
-        input_dir=html_combined_dir,
-        output_dir=markdown_output_dir,
-        excel_path=topics_excel_path,
-        mappings_path=html_mappings_path
-    )
+        # Wait for both to complete
+        html_future.result()
+        pdf_future.result()
 
-    combine_domains_by_timestamp(
-        input_dir=pdf_raw_dir,
-        output_dir=pdf_combined_dir,
-        timestamps_json_path=timestamps_json_path
-    )
+    print("\n" + "=" * 70)
+    print("STAGE 2: Domain Combination and Markdown Conversion (HTML and PDF in parallel)")
+    print("=" * 70)
 
-    convert_pdf_combined_to_markdown(
-        input_dir=pdf_combined_dir,
-        output_dir=markdown_output_dir,
-        excel_path=topics_excel_path,
-        mappings_path=pdf_mappings_path
-    )
+    # OPTIMIZATION 2: Run HTML and PDF processing pipelines in parallel
+    def process_html_pipeline():
+        combine_domains_by_timestamp(
+            input_dir=html_raw_dir,
+            output_dir=html_combined_dir,
+            timestamps_json_path=timestamps_json_path
+        )
+        convert_html_combined_to_markdown(
+            input_dir=html_combined_dir,
+            output_dir=markdown_output_dir,
+            excel_path=topics_excel_path,
+            mappings_path=html_mappings_path
+        )
+
+    def process_pdf_pipeline():
+        combine_domains_by_timestamp(
+            input_dir=pdf_raw_dir,
+            output_dir=pdf_combined_dir,
+            timestamps_json_path=timestamps_json_path
+        )
+        convert_pdf_combined_to_markdown(
+            input_dir=pdf_combined_dir,
+            output_dir=markdown_output_dir,
+            excel_path=topics_excel_path,
+            mappings_path=pdf_mappings_path
+        )
+
+    # Run HTML and PDF pipelines concurrently
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        html_pipeline_future = executor.submit(process_html_pipeline)
+        pdf_pipeline_future = executor.submit(process_pdf_pipeline)
+
+        # Wait for both pipelines to complete
+        html_pipeline_future.result()
+        pdf_pipeline_future.result()
+
+    print("\n" + "=" * 70)
+    print("STAGE 3: Elasticsearch Indexing")
+    print("=" * 70)
 
     index_markdown_to_elasticsearch(
         clean_index=True,

@@ -12,6 +12,9 @@ from pathlib import Path
 from tqdm import tqdm
 import pandas as pd
 from html_to_markdown import convert_to_markdown
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from functools import partial
+import multiprocessing as mp
 
 
 def get_base_site_from_url(url_in):
@@ -100,13 +103,14 @@ def load_allowed_domains(excel_path):
     return allowed_domains
 
 
-def convert_html_to_markdown(html_path, output_path):
+def convert_html_to_markdown(html_path, output_path, create_dirs=True):
     """
     Convert a single HTML file to markdown.
 
     Args:
         html_path (Path): Path to HTML file
         output_path (Path): Path where markdown should be saved
+        create_dirs (bool): Whether to create directories (set False if pre-created)
 
     Returns:
         bool: True if successful, False otherwise
@@ -135,7 +139,8 @@ def convert_html_to_markdown(html_path, output_path):
             return False
 
         # Create output directory if needed
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if create_dirs:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Write markdown file
         with open(output_path, 'w', encoding='utf-8') as f:
@@ -148,6 +153,91 @@ def convert_html_to_markdown(html_path, output_path):
         return False
 
 
+def process_single_html_file(args):
+    """
+    Process a single HTML file (for parallel execution).
+
+    Args:
+        args: Tuple of (html_file, domain_folder, output_path, filenames_to_remove)
+
+    Returns:
+        tuple: (status, count) where status is 'converted' or 'skipped'
+    """
+    html_file, domain_folder, output_path, filenames_to_remove = args
+
+    # Check if filename should be skipped
+    for keyword in filenames_to_remove:
+        if keyword in html_file.name.lower():
+            return ('skipped', 1)
+
+    # Calculate relative path from domain folder
+    rel_path = html_file.relative_to(domain_folder)
+
+    # Create output path (change extension to .md)
+    if str(html_file).endswith('.html.gz'):
+        md_filename = html_file.name.replace('.html.gz', '.md')
+    else:
+        md_filename = html_file.stem + '.md'
+
+    output_file_path = output_path / domain_folder.name / rel_path.parent / md_filename
+
+    # Convert HTML to markdown (dirs already created in batch)
+    if convert_html_to_markdown(html_file, output_file_path, create_dirs=False):
+        return ('converted', 1)
+    else:
+        return ('skipped', 1)
+
+
+def process_domain_parallel(domain_folder, input_path, output_path, allowed_domains, filenames_to_remove, max_workers=16):
+    """
+    Process all HTML files in a domain folder in parallel.
+
+    Args:
+        domain_folder (Path): Domain folder to process
+        input_path (Path): Input base path
+        output_path (Path): Output base path
+        allowed_domains (set): Set of allowed domains (or None)
+        filenames_to_remove (list): Keywords to skip
+        max_workers (int): Number of thread workers for file I/O
+
+    Returns:
+        dict: Results with 'domain', 'converted', 'skipped' counts
+    """
+    domain = domain_folder.name
+
+    # Check if domain is in allowed list (if filtering is enabled)
+    if allowed_domains is not None and domain not in allowed_domains:
+        return {'domain': domain, 'converted': 0, 'skipped': 0}
+
+    # Collect all HTML files in this domain folder
+    html_files = []
+    for html_file in domain_folder.rglob('*'):
+        if not html_file.is_file():
+            continue
+        # Check if it's an HTML file
+        if html_file.suffix in ['.html', '.htm'] or str(html_file).endswith('.html.gz'):
+            html_files.append(html_file)
+
+    if not html_files:
+        return {'domain': domain, 'converted': 0, 'skipped': 0}
+
+    # Prepare arguments for parallel processing
+    file_args = [(f, domain_folder, output_path, filenames_to_remove) for f in html_files]
+
+    converted = 0
+    skipped = 0
+
+    # Process files in parallel using threads (I/O bound)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for status, count in executor.map(process_single_html_file, file_args):
+            if status == 'converted':
+                converted += count
+            else:
+                skipped += count
+
+    return {'domain': domain, 'converted': converted, 'skipped': skipped}
+
+
 def convert_html_combined_to_markdown(
     input_dir,
     output_dir,
@@ -156,11 +246,14 @@ def convert_html_combined_to_markdown(
     filenames_to_remove=[
         "impressum", "datenschutz", "kontakt", "robots",
         "imprint", "data-protection", "contact", "copyright",
-    ]
+    ],
+    max_domain_workers=None,
+    max_file_workers=16
 ):
     """
     Convert HTML files from html_combined directory to markdown files.
     Creates one markdown file per HTML page, maintaining folder structure.
+    Uses parallel processing for both domains and files within domains.
 
     Args:
         input_dir (str): Path to html_combined directory
@@ -169,12 +262,14 @@ def convert_html_combined_to_markdown(
             If None, processes all domains.
         mappings_path (str, optional): Path to save domain->URL mappings JSON file
         filenames_to_remove (list): Keywords that if found in filename, file is skipped
+        max_domain_workers (int, optional): Max parallel domains. If None, uses CPU count.
+        max_file_workers (int): Max parallel files per domain (default: 16)
 
     Returns:
         dict: Summary with 'domains_processed', 'files_converted', 'files_skipped'
     """
     print("=" * 70)
-    print("HTML to Markdown Converter")
+    print("HTML to Markdown Converter (Parallelized)")
     print("=" * 70)
     print(f"Input:  {input_dir}")
     print(f"Output: {output_dir}")
@@ -212,61 +307,55 @@ def convert_html_combined_to_markdown(
     input_path = Path(input_dir)
     output_path = Path(output_dir)
 
-    files_converted = 0
-    files_skipped = 0
-    domains_processed = set()
-
     # Walk through all domain folders in html_combined
     domain_folders = [d for d in input_path.iterdir() if d.is_dir()]
 
-    print(f"\nProcessing {len(domain_folders)} domain folders...")
+    # Filter domains if allowed_domains is provided
+    if allowed_domains is not None:
+        domain_folders = [d for d in domain_folders if d.name in allowed_domains]
+
+    print(f"\nProcessing {len(domain_folders)} domain folders in parallel...")
     print("=" * 70)
 
-    for domain_folder in tqdm(domain_folders, desc="Processing domains", unit="domain"):
-        domain = domain_folder.name
+    # OPTIMIZATION 4: Batch directory creation
+    # Pre-create all output directories for domains
+    print("Pre-creating output directories...")
+    for domain_folder in domain_folders:
+        domain_output_dir = output_path / domain_folder.name
+        domain_output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Check if domain is in allowed list (if filtering is enabled)
-        if allowed_domains is not None and domain not in allowed_domains:
-            continue
+        # Also create subdirectories based on input structure
+        for subdir in domain_folder.rglob('*'):
+            if subdir.is_dir():
+                rel_path = subdir.relative_to(domain_folder)
+                (domain_output_dir / rel_path).mkdir(parents=True, exist_ok=True)
 
-        domains_processed.add(domain)
+    # Determine number of workers
+    if max_domain_workers is None:
+        max_domain_workers = min(mp.cpu_count(), len(domain_folders))
 
-        # Walk through all HTML files in this domain folder
-        for html_file in domain_folder.rglob('*'):
-            if not html_file.is_file():
-                continue
+    # OPTIMIZATION 1 & 3: Process domains in parallel using ProcessPoolExecutor
+    process_func = partial(
+        process_domain_parallel,
+        input_path=input_path,
+        output_path=output_path,
+        allowed_domains=allowed_domains,
+        filenames_to_remove=filenames_to_remove,
+        max_workers=max_file_workers
+    )
 
-            # Check if it's an HTML file
-            if not (html_file.suffix in ['.html', '.htm'] or str(html_file).endswith('.html.gz')):
-                continue
+    results = []
+    with ProcessPoolExecutor(max_workers=max_domain_workers) as executor:
+        futures = [executor.submit(process_func, df) for df in domain_folders]
 
-            # Check if filename should be skipped
-            skip_file = False
-            for keyword in filenames_to_remove:
-                if keyword in html_file.name.lower():
-                    skip_file = True
-                    files_skipped += 1
-                    break
+        for future in tqdm(as_completed(futures), total=len(domain_folders),
+                          desc="Processing domains", unit="domain"):
+            results.append(future.result())
 
-            if skip_file:
-                continue
-
-            # Calculate relative path from domain folder
-            rel_path = html_file.relative_to(domain_folder)
-
-            # Create output path (change extension to .md)
-            if str(html_file).endswith('.html.gz'):
-                md_filename = html_file.name.replace('.html.gz', '.md')
-            else:
-                md_filename = html_file.stem + '.md'
-
-            output_file_path = output_path / domain / rel_path.parent / md_filename
-
-            # Convert HTML to markdown
-            if convert_html_to_markdown(html_file, output_file_path):
-                files_converted += 1
-            else:
-                files_skipped += 1
+    # Aggregate results
+    domains_processed = {r['domain'] for r in results if r['converted'] > 0 or r['skipped'] > 0}
+    files_converted = sum(r['converted'] for r in results)
+    files_skipped = sum(r['skipped'] for r in results)
 
     print("\n" + "=" * 70)
     print(f"✓ Processed {len(domains_processed)} domains")
