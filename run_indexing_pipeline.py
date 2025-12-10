@@ -99,17 +99,17 @@ def main():
         mappings_path=pdf_mappings_path
     )
 
-    # index_markdown_to_elasticsearch(
-    #     clean_index=True,
-    #     es_user=es_username,
-    #     es_password=es_password,
-    #     es_url=es_url,
-    #     embedding_model=embedding_model,
-    #     markdown_dir=markdown_output_dir,
-    #     index_name=index_name,
-    #     mappings_path=html_mappings_path,
-    #     timestamps_path=timestamps_json_path
-    # )
+    index_markdown_to_elasticsearch(
+        clean_index=True,
+        es_user=es_username,
+        es_password=es_password,
+        es_url=es_url,
+        embedding_model=embedding_model,
+        markdown_dir=markdown_output_dir,
+        index_name=index_name,
+        mappings_path=html_mappings_path,
+        timestamps_path=timestamps_json_path
+    )
 
 
 if __name__ == "__main__":
