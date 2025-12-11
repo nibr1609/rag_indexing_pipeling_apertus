@@ -15,6 +15,7 @@ import json
 import pandas as pd
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import cpu_count
+import hashlib
 
 
 def extract_timestamp_and_domain(folder_name):
@@ -135,6 +136,136 @@ def scan_html_folders(input_dir, allowed_domains=None):
     return domain_folders
 
 
+def normalize_filename(filepath_str):
+    """
+    Normalize filenames by removing duplicate indicators like (1), (2), etc.
+
+    Examples:
+        'subfolder/en(1).html' -> 'subfolder/en.html'
+        'subfolder/en(2).html' -> 'subfolder/en.html'
+        'subfolder/en.html' -> 'subfolder/en.html'
+
+    Returns:
+        str: normalized path
+    """
+    path = Path(filepath_str)
+    parent = path.parent
+
+    # Pattern to match (N) before the extension
+    pattern = r'\(\d+\)'
+
+    # Split filename into stem and suffix
+    stem = path.stem
+    suffix = path.suffix
+
+    # Remove all (N) patterns from the stem
+    normalized_stem = re.sub(pattern, '', stem)
+
+    # Reconstruct the normalized filename
+    normalized_filename = f"{normalized_stem}{suffix}"
+    normalized_path = str(parent / normalized_filename)
+
+    return normalized_path
+
+
+def get_file_hash_fast(file_path, chunk_size=8192):
+    """
+    Fast file hash using first chunk, middle chunk, and last chunk.
+    This is much faster than hashing the entire file.
+    """
+    file_size = file_path.stat().st_size
+
+    # For small files, just hash everything
+    if file_size < chunk_size * 3:
+        hasher = hashlib.md5()
+        with open(file_path, 'rb') as f:
+            hasher.update(f.read())
+        return hasher.hexdigest()
+
+    # For larger files: hash first chunk + middle chunk + last chunk
+    hasher = hashlib.md5()
+    with open(file_path, 'rb') as f:
+        # First chunk
+        hasher.update(f.read(chunk_size))
+
+        # Middle chunk
+        f.seek(file_size // 2)
+        hasher.update(f.read(chunk_size))
+
+        # Last chunk
+        f.seek(-chunk_size, 2)
+        hasher.update(f.read(chunk_size))
+
+    return hasher.hexdigest()
+
+
+def deduplicate_files(files_dict):
+    """
+    Deduplicate files with pattern like name.html, name(1).html, name(2).html.
+    Uses file size first (fast), then content hash only when needed.
+
+    Args:
+        files_dict: dict mapping relative_path -> absolute_path
+
+    Returns:
+        dict: deduplicated dict mapping relative_path -> absolute_path
+    """
+    # Group files by their normalized name
+    groups = defaultdict(list)
+
+    for rel_path, abs_path in files_dict.items():
+        normalized = normalize_filename(rel_path)
+        groups[normalized].append((rel_path, abs_path))
+
+    # For each group, pick the best file
+    deduplicated = {}
+    duplicates_removed = 0
+
+    for normalized_path, file_list in groups.items():
+        if len(file_list) == 1:
+            # No duplicates, keep the file
+            rel_path, abs_path = file_list[0]
+            deduplicated[rel_path] = abs_path
+        else:
+            # Multiple files - deduplicate by size then hash
+            duplicates_removed += len(file_list) - 1
+
+            # Collect file info: (rel_path, abs_path, size)
+            file_info = []
+            for rel_path, abs_path in file_list:
+                size = abs_path.stat().st_size
+                file_info.append((rel_path, abs_path, size))
+
+            # Sort by size descending (larger files are likely more complete)
+            file_info.sort(key=lambda x: x[2], reverse=True)
+
+            # Check if all files have the same size
+            sizes = [info[2] for info in file_info]
+            if len(set(sizes)) == 1:
+                # Same size - check content hash
+                hashes = {}
+                for rel_path, abs_path, size in file_info:
+                    file_hash = get_file_hash_fast(abs_path)
+                    if file_hash not in hashes:
+                        hashes[file_hash] = (rel_path, abs_path)
+
+                # Pick first unique hash (prefer original name without (N))
+                for rel_path, abs_path, _ in file_info:
+                    file_hash = get_file_hash_fast(abs_path)
+                    if hashes[file_hash][0] == rel_path:
+                        deduplicated[rel_path] = abs_path
+                        break
+            else:
+                # Different sizes - keep the largest one
+                rel_path, abs_path, _ = file_info[0]
+                deduplicated[rel_path] = abs_path
+
+    if duplicates_removed > 0:
+        print(f"  Removed {duplicates_removed} duplicate files")
+
+    return deduplicated
+
+
 def get_all_files_in_folder(folder_path):
     """
     Get all HTML files in a folder with their relative paths.
@@ -155,6 +286,7 @@ def combine_domain_folders(domain, folder_list, output_dir):
     """
     Combine multiple folders for the same domain.
     For duplicate files, keep the one with the newest timestamp.
+    Deduplicates files with pattern like name.html, name(1).html, name(2).html.
     Returns file count and timestamp metadata.
     """
     print(f"\nProcessing domain: {domain}")
@@ -170,6 +302,9 @@ def combine_domain_folders(domain, folder_list, output_dir):
     # Process each folder for this domain
     for timestamp, folder_path in folder_list:
         files = get_all_files_in_folder(folder_path)
+
+        # Deduplicate files within this folder first (removes name(1).html, name(2).html, etc.)
+        files = deduplicate_files(files)
 
         for relative_path, absolute_path in files.items():
             # If we haven't seen this file yet, or this version is newer
