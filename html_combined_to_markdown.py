@@ -261,13 +261,13 @@ def convert_html_combined_to_markdown(
         "impressum", "datenschutz", "kontakt", "robots",
         "imprint", "data-protection", "contact", "copyright",
     ],
-    max_domain_workers=None,
+    max_domain_workers=None,  # Deprecated - kept for compatibility
     max_file_workers=None
 ):
     """
     Convert HTML files from html_combined directory to markdown files.
     Creates one markdown file per HTML page, maintaining folder structure.
-    Uses parallel processing for both domains and files within domains.
+    Uses ThreadPoolExecutor for file-level parallelism (domains processed sequentially).
 
     Args:
         input_dir (str): Path to html_combined directory
@@ -276,8 +276,8 @@ def convert_html_combined_to_markdown(
             If None, processes all domains.
         mappings_path (str, optional): Path to save domain->URL mappings JSON file
         filenames_to_remove (list): Keywords that if found in filename, file is skipped
-        max_domain_workers (int, optional): Max parallel domains. If None, uses CPU count.
-        max_file_workers (int, optional): Max parallel files per domain. If None, uses CPU count.
+        max_domain_workers (int, optional): DEPRECATED - Kept for compatibility, not used.
+        max_file_workers (int, optional): Max parallel files per domain. If None, uses min(16, CPU count).
 
     Returns:
         dict: Summary with 'domains_processed', 'files_converted', 'files_skipped'
@@ -345,50 +345,40 @@ def convert_html_combined_to_markdown(
         # Subdirectories will be created on-demand during file writing
 
     # Determine number of workers
-    if max_domain_workers is None:
-        # Limit to 4 workers on HPC to avoid memory issues
-        max_domain_workers = min(4, mp.cpu_count(), len(domain_folders))
-
-    # Limit file workers to avoid nested parallelism issues
+    # Use ThreadPoolExecutor only (no ProcessPoolExecutor) to avoid worker crashes
     if max_file_workers is None:
-        max_file_workers = 2  # Conservative default for nested parallelism
+        max_file_workers = min(16, mp.cpu_count())  # Use more threads since no process overhead
 
-    print(f"Using {max_domain_workers} domain workers, {max_file_workers} file workers per domain")
+    print(f"Processing domains sequentially with {max_file_workers} file workers per domain")
+    print("  (Using ThreadPoolExecutor only to avoid process crashes)")
 
-    # OPTIMIZATION 1 & 3: Process domains in parallel using ProcessPoolExecutor
-    # Don't pass allowed_domains to workers - domains are already filtered above
-    process_func = partial(
-        process_domain_parallel,
-        input_path=input_path,
-        output_path=output_path,
-        allowed_domains=None,  # Already filtered - save memory
-        filenames_to_remove=filenames_to_remove,
-        max_workers=max_file_workers
-    )
-
-    # Clear allowed_domains and domain_mappings from main process memory
+    # Clear allowed_domains and domain_mappings from memory
     del allowed_domains
     if 'domain_mappings' in locals():
         del domain_mappings
-    gc.collect()  # Force garbage collection before spawning workers
+    gc.collect()  # Force garbage collection
 
     results = []
     failed_domains = []
 
-    with ProcessPoolExecutor(max_workers=max_domain_workers) as executor:
-        futures = {executor.submit(process_func, df): df.name for df in domain_folders}
-
-        for future in tqdm(as_completed(futures), total=len(domain_folders),
-                          desc="Processing domains", unit="domain"):
-            domain_name = futures[future]
-            try:
-                result = future.result(timeout=300)  # 5 minute timeout per domain
-                results.append(result)
-            except Exception as e:
-                print(f"\nError processing domain {domain_name}: {e}")
-                failed_domains.append(domain_name)
-                # Add empty result to continue
-                results.append({'domain': domain_name, 'converted': 0, 'skipped': 0})
+    # Process domains sequentially to avoid ProcessPoolExecutor crashes
+    for domain_folder in tqdm(domain_folders, desc="Processing domains", unit="domain"):
+        domain_name = domain_folder.name
+        try:
+            result = process_domain_parallel(
+                domain_folder=domain_folder,
+                input_path=input_path,
+                output_path=output_path,
+                allowed_domains=None,
+                filenames_to_remove=filenames_to_remove,
+                max_workers=max_file_workers
+            )
+            results.append(result)
+        except Exception as e:
+            print(f"\nError processing domain {domain_name}: {e}")
+            failed_domains.append(domain_name)
+            # Add empty result to continue
+            results.append({'domain': domain_name, 'converted': 0, 'skipped': 0})
 
     # Aggregate results
     domains_processed = {r['domain'] for r in results if r['converted'] > 0 or r['skipped'] > 0}
