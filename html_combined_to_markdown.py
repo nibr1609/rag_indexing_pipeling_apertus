@@ -15,6 +15,7 @@ from html_to_markdown import convert_to_markdown
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from functools import partial
 import multiprocessing as mp
+import gc
 
 
 def get_base_site_from_url(url_in):
@@ -181,8 +182,8 @@ def process_single_html_file(args):
 
     output_file_path = output_path / domain_folder.name / rel_path.parent / md_filename
 
-    # Convert HTML to markdown (dirs already created in batch)
-    if convert_html_to_markdown(html_file, output_file_path, create_dirs=False):
+    # Convert HTML to markdown (create subdirs on-demand to save memory)
+    if convert_html_to_markdown(html_file, output_file_path, create_dirs=True):
         return ('converted', 1)
     else:
         return ('skipped', 1)
@@ -228,15 +229,25 @@ def process_domain_parallel(domain_folder, input_path, output_path, allowed_doma
     skipped = 0
 
     # Determine number of workers for files within this domain
-    file_workers = max_workers if max_workers is not None else mp.cpu_count()
+    file_workers = max_workers if max_workers is not None else min(2, mp.cpu_count())
 
     # Process files in parallel using threads (I/O bound)
-    with ThreadPoolExecutor(max_workers=file_workers) as executor:
-        for status, count in executor.map(process_single_html_file, file_args):
-            if status == 'converted':
-                converted += count
-            else:
-                skipped += count
+    try:
+        with ThreadPoolExecutor(max_workers=file_workers) as executor:
+            for status, count in executor.map(process_single_html_file, file_args):
+                if status == 'converted':
+                    converted += count
+                else:
+                    skipped += count
+    except Exception as e:
+        print(f"Error in thread pool for domain {domain}: {e}")
+        # Mark remaining files as skipped
+        skipped += len(file_args) - (converted + skipped)
+    finally:
+        # Clean up memory after processing this domain
+        del html_files
+        del file_args
+        gc.collect()
 
     return {'domain': domain, 'converted': converted, 'skipped': skipped}
 
@@ -306,6 +317,11 @@ def convert_html_combined_to_markdown(
             json.dump(domain_mappings, f, indent=2)
         print(f"Saved domain mappings to {mappings_path}")
 
+        # Clear large DataFrame from memory
+        del df
+        del urls
+        gc.collect()  # Force garbage collection
+
     # Process files
     input_path = Path(input_dir)
     output_path = Path(output_dir)
@@ -320,40 +336,59 @@ def convert_html_combined_to_markdown(
     print(f"\nProcessing {len(domain_folders)} domain folders in parallel...")
     print("=" * 70)
 
-    # OPTIMIZATION 4: Batch directory creation
-    # Pre-create all output directories for domains
+    # OPTIMIZATION 4: Batch directory creation - Only top-level
+    # Pre-create only top-level output directories (subdirs created during processing)
     print("Pre-creating output directories...")
     for domain_folder in domain_folders:
         domain_output_dir = output_path / domain_folder.name
         domain_output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Also create subdirectories based on input structure
-        for subdir in domain_folder.rglob('*'):
-            if subdir.is_dir():
-                rel_path = subdir.relative_to(domain_folder)
-                (domain_output_dir / rel_path).mkdir(parents=True, exist_ok=True)
+        # Subdirectories will be created on-demand during file writing
 
     # Determine number of workers
     if max_domain_workers is None:
-        max_domain_workers = min(mp.cpu_count(), len(domain_folders))
+        # Limit to 4 workers on HPC to avoid memory issues
+        max_domain_workers = min(4, mp.cpu_count(), len(domain_folders))
+
+    # Limit file workers to avoid nested parallelism issues
+    if max_file_workers is None:
+        max_file_workers = 2  # Conservative default for nested parallelism
+
+    print(f"Using {max_domain_workers} domain workers, {max_file_workers} file workers per domain")
 
     # OPTIMIZATION 1 & 3: Process domains in parallel using ProcessPoolExecutor
+    # Don't pass allowed_domains to workers - domains are already filtered above
     process_func = partial(
         process_domain_parallel,
         input_path=input_path,
         output_path=output_path,
-        allowed_domains=allowed_domains,
+        allowed_domains=None,  # Already filtered - save memory
         filenames_to_remove=filenames_to_remove,
         max_workers=max_file_workers
     )
 
+    # Clear allowed_domains and domain_mappings from main process memory
+    del allowed_domains
+    if 'domain_mappings' in locals():
+        del domain_mappings
+    gc.collect()  # Force garbage collection before spawning workers
+
     results = []
+    failed_domains = []
+
     with ProcessPoolExecutor(max_workers=max_domain_workers) as executor:
-        futures = [executor.submit(process_func, df) for df in domain_folders]
+        futures = {executor.submit(process_func, df): df.name for df in domain_folders}
 
         for future in tqdm(as_completed(futures), total=len(domain_folders),
                           desc="Processing domains", unit="domain"):
-            results.append(future.result())
+            domain_name = futures[future]
+            try:
+                result = future.result(timeout=300)  # 5 minute timeout per domain
+                results.append(result)
+            except Exception as e:
+                print(f"\nError processing domain {domain_name}: {e}")
+                failed_domains.append(domain_name)
+                # Add empty result to continue
+                results.append({'domain': domain_name, 'converted': 0, 'skipped': 0})
 
     # Aggregate results
     domains_processed = {r['domain'] for r in results if r['converted'] > 0 or r['skipped'] > 0}
@@ -364,6 +399,10 @@ def convert_html_combined_to_markdown(
     print(f"✓ Processed {len(domains_processed)} domains")
     print(f"✓ Converted {files_converted} files")
     print(f"✓ Skipped {files_skipped} files")
+    if failed_domains:
+        print(f"⚠ Failed {len(failed_domains)} domains: {', '.join(failed_domains[:5])}")
+        if len(failed_domains) > 5:
+            print(f"  ... and {len(failed_domains) - 5} more")
     print(f"✓ Output directory: {output_dir}")
     print("=" * 70)
 
