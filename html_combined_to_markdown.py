@@ -132,8 +132,21 @@ def convert_html_to_markdown(html_path, output_path, create_dirs=True):
         if not html_content or html_content == "":
             return False
 
-        # Convert to markdown
-        markdown_text = convert_to_markdown(str(html_content))
+        # Sanitize HTML content to avoid Rust panics on invalid UTF-8
+        if isinstance(html_content, bytes):
+            # Decode with error handling - replace invalid UTF-8 sequences
+            html_content = html_content.decode('utf-8', errors='replace')
+        else:
+            # Ensure string is valid UTF-8
+            html_content = str(html_content).encode('utf-8', errors='replace').decode('utf-8')
+
+        # Convert to markdown (with error handling for Rust panics)
+        try:
+            markdown_text = convert_to_markdown(html_content)
+        except Exception:
+            # Rust library can panic on malformed UTF-8 or invalid HTML
+            # Skip these files silently to avoid crashing the entire pipeline
+            return False
 
         # Skip empty or redirect-only files
         if markdown_text in ("", "Redirecting"):
@@ -150,7 +163,7 @@ def convert_html_to_markdown(html_path, output_path, create_dirs=True):
         return True
 
     except Exception as e:
-        print(f"Error processing {html_path}: {e}")
+        # Silently skip files with errors to keep pipeline running
         return False
 
 
