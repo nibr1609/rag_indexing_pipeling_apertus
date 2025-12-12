@@ -35,9 +35,7 @@ class RemoteEmbedding(BaseEmbedding):
         timeout: float = 300.0,
         **kwargs: Any
     ):
-        super().__init__(**kwargs)
-        self.service_url = service_url
-        self.timeout = timeout
+        super().__init__(service_url=service_url, timeout=timeout, **kwargs)
 
     @classmethod
     def class_name(cls) -> str:
