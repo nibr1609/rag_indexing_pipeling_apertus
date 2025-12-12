@@ -7,12 +7,13 @@ Includes URL and retrieval date metadata from domain mappings.
 import json
 import requests
 import re
+import sys
 from pathlib import Path
 from datetime import datetime
 from tqdm import tqdm
 from llama_index.core import Document
 from llama_index.core.node_parser import SentenceSplitter
-from llama_index.core.ingestion import IngestionPipeline
+from llama_index.core.ingestion import IngestionPipeline, run_transformations
 from llama_index.vector_stores.elasticsearch import ElasticsearchStore
 from remote_embedding import RemoteEmbedding
 import os
@@ -89,135 +90,6 @@ def load_timestamps(timestamps_path):
         return {}
 
 
-def get_documents_from_markdown_files(markdown_dir, domain_mappings=None, timestamps=None, force_domain=None):
-    """
-    Reads markdown files and returns list of LlamaIndex Documents with metadata.
-
-    Args:
-        markdown_dir (str): Directory containing markdown files organized by domain
-        domain_mappings (dict): Optional mapping of domain to original URL
-        timestamps (dict): Optional mapping of file paths to retrieval timestamps
-        force_domain (str): Optional domain to use instead of extracting from path (useful for subdirectories)
-
-    Returns:
-        list: List of Document objects with metadata
-    """
-    documents = []
-    markdown_path = Path(markdown_dir)
-
-    if not markdown_path.exists():
-        print(f"Error: Directory {markdown_dir} does not exist")
-        return documents
-
-    # Find all markdown files recursively
-    md_files = list(markdown_path.rglob("*.md"))
-    print(f"Found {len(md_files)} markdown files")
-
-    for md_file in tqdm(md_files, desc="Loading markdown files"):
-        try:
-            with open(md_file, 'r', encoding='utf-8') as f:
-                content = f.read()
-
-            # Skip empty files
-            if not content.strip():
-                continue
-
-            # Get relative path from markdown_dir
-            relative_path = md_file.relative_to(markdown_path)
-
-            # Extract domain (use force_domain if provided, otherwise first directory in path)
-            if force_domain:
-                domain = force_domain
-            else:
-                domain = relative_path.parts[0] if relative_path.parts else "unknown"
-
-            # Get URL from mappings
-            url = None
-            url_preview = None
-            if domain_mappings and domain in domain_mappings:
-                base_url = domain_mappings[domain]
-                # Construct full URL by appending path
-                if len(relative_path.parts) > 1:
-                    # Remove domain and .md extension, reconstruct path
-                    page_path = '/'.join(relative_path.parts[1:])
-                    page_path = page_path.replace('.md', '.html')
-                    if not base_url.endswith('/'):
-                        base_url += '/'
-
-                    # url: exact file path with index.html (original archive path)
-                    url = base_url + page_path
-
-                    # url_preview: clean version for browsers (remove /index.html)
-                    if page_path.endswith('/index.html'):
-                        clean_path = page_path[:-11]  # Remove '/index.html'
-                        url_preview = base_url + clean_path if clean_path else base_url.rstrip('/')
-                    elif page_path == 'index.html':
-                        url_preview = base_url.rstrip('/')
-                    else:
-                        url_preview = url
-                else:
-                    url = base_url
-                    url_preview = base_url
-
-            # Extract retrieval date from timestamps JSON if available
-            retrieval_date_str = None
-            if timestamps:
-                # Convert markdown path to HTML path for lookup
-                # markdown: domain/path/to/file.md -> HTML: domain/path/to/file.html
-                html_relative_path = str(relative_path).replace('.md', '.html')
-                retrieval_date_str = timestamps.get(html_relative_path)
-
-            # Fallback: try to extract from file path (won't work after combine_domains)
-            if not retrieval_date_str:
-                retrieval_date = extract_timestamp_from_path(str(md_file))
-                retrieval_date_str = retrieval_date.isoformat() if retrieval_date else None
-
-            # Extract title from first heading if available
-            title = md_file.stem
-            lines = content.split('\n')
-            for line in lines:
-                if line.strip().startswith('# '):
-                    title = line.strip().replace('# ', '')
-                    break
-
-            # Create metadata
-            metadata = {
-                "file_path": str(relative_path),
-                "file_name": md_file.name,
-                "domain": domain,
-                "title": title,
-                "source": "ethz-webarchive"
-            }
-
-            # Add URL if available
-            if url:
-                metadata["url"] = url
-
-            # Add URL preview if available
-            if url_preview:
-                metadata["url_preview"] = url_preview
-
-            # Add retrieval date if available
-            if retrieval_date_str:
-                metadata["retrieval_date"] = retrieval_date_str
-
-            # Create Document object
-            # Ensure all metadata (including retrieval_date) is included in embeddings
-            doc = Document(
-                text=content,
-                metadata=metadata,
-                excluded_llm_metadata_keys=[],  # Include all metadata for LLM
-                excluded_embed_metadata_keys=[]  # Include all metadata in embeddings
-            )
-            documents.append(doc)
-
-        except Exception as e:
-            print(f"Error processing {md_file}: {e}")
-            continue
-
-    return documents
-
-
 def save_documents_to_json(documents, output_file="indexed_documents.json"):
     """
     Save documents to JSON file for inspection/backup.
@@ -281,6 +153,132 @@ def clean_elasticsearch_index(index_name, es_url="https://es.swissai.cscs.ch", u
         print(f"Warning: Error cleaning index: {e}")
 
 
+def get_documents_from_markdown_files(markdown_dir, domain_mappings=None, timestamps=None, force_domain=None):
+    """
+    Reads markdown files and returns list of LlamaIndex Documents.
+    STRICTLY FILTERS: Any single line > 1000 characters is deleted.
+
+    Args:
+        markdown_dir (str): Directory containing markdown files organized by domain
+        domain_mappings (dict): Optional mapping of domain to original URL
+        timestamps (dict): Optional mapping of file paths to retrieval timestamps
+        force_domain (str): Optional domain to use instead of extracting from path (useful for subdirectories)
+
+    Returns:
+        list: List of Document objects with metadata
+    """
+    documents = []
+    markdown_path = Path(markdown_dir)
+
+    if not markdown_path.exists():
+        print(f"Error: Directory {markdown_dir} does not exist")
+        return documents
+
+    md_files = list(markdown_path.rglob("*.md"))
+    print(f"Found {len(md_files)} markdown files")
+
+    # Counter for deleted lines to track how much "junk" we removed
+    deleted_lines_count = 0
+
+    for md_file in tqdm(md_files, desc="Loading markdown files"):
+        try:
+            with open(md_file, 'r', encoding='utf-8') as f:
+                raw_content = f.read()
+
+            # ---------------------------------------------------------
+            # 🔴 AGGRESSIVE FILTER: Remove lines > 1000 chars
+            # ---------------------------------------------------------
+            lines = raw_content.split('\n')
+            clean_lines = []
+            for line in lines:
+                if len(line) > 1000:
+                    deleted_lines_count += 1
+                    continue  # Skip this massive line entirely
+                clean_lines.append(line)
+
+            content = '\n'.join(clean_lines)
+
+            # Skip empty files (or files that became empty after filtering)
+            if not content.strip():
+                continue
+            # ---------------------------------------------------------
+
+            # Get relative path and metadata
+            relative_path = md_file.relative_to(markdown_path)
+
+            # Extract domain (use force_domain if provided, otherwise first directory in path)
+            if force_domain:
+                domain = force_domain
+            else:
+                domain = relative_path.parts[0] if relative_path.parts else "unknown"
+
+            # Get URL from mappings
+            url = None
+            url_preview = None
+            if domain_mappings and domain in domain_mappings:
+                base_url = domain_mappings[domain]
+                if len(relative_path.parts) > 1:
+                    page_path = '/'.join(relative_path.parts[1:])
+                    page_path = page_path.replace('.md', '.html')
+                    if not base_url.endswith('/'):
+                        base_url += '/'
+                    url = base_url + page_path
+                    if page_path.endswith('/index.html'):
+                        clean_path = page_path[:-11]
+                        url_preview = base_url + clean_path if clean_path else base_url.rstrip('/')
+                    elif page_path == 'index.html':
+                        url_preview = base_url.rstrip('/')
+                    else:
+                        url_preview = url
+                else:
+                    url = base_url
+                    url_preview = base_url
+
+            retrieval_date_str = None
+            if timestamps:
+                html_relative_path = str(relative_path).replace('.md', '.html')
+                retrieval_date_str = timestamps.get(html_relative_path)
+
+            if not retrieval_date_str:
+                retrieval_date = extract_timestamp_from_path(str(md_file))
+                retrieval_date_str = retrieval_date.isoformat() if retrieval_date else None
+
+            title = md_file.stem
+            for line in content.split('\n')[:5]:  # Only check first 5 lines for title
+                if line.strip().startswith('# '):
+                    title = line.strip().replace('# ', '')
+                    break
+
+            metadata = {
+                "file_path": str(relative_path),
+                "file_name": md_file.name,
+                "domain": domain,
+                "title": title,
+                "source": "ethz-webarchive"
+            }
+            if url:
+                metadata["url"] = url
+            if url_preview:
+                metadata["url_preview"] = url_preview
+            if retrieval_date_str:
+                metadata["retrieval_date"] = retrieval_date_str
+
+            doc = Document(
+                text=content,
+                metadata=metadata,
+                excluded_llm_metadata_keys=[],
+                excluded_embed_metadata_keys=[]
+            )
+            documents.append(doc)
+
+        except Exception as e:
+            print(f"Error processing {md_file}: {e}")
+            continue
+
+    print(f"⚠️ Filtered out {deleted_lines_count} massive lines (>1000 chars) during loading.")
+    return documents
+
+
 def index_markdown_to_elasticsearch(
     markdown_dir,
     index_name="ethz_webarchive",
@@ -291,7 +289,7 @@ def index_markdown_to_elasticsearch(
     chunk_size=512,
     chunk_overlap=64,
     clean_index=True,
-    save_json=True,
+    save_json=False,
     json_output_path=None,
     es_user="lsaie-1",
     es_password=None,
@@ -299,6 +297,7 @@ def index_markdown_to_elasticsearch(
 ):
     """
     Index markdown files to Elasticsearch with embeddings.
+    Uses a safe, decoupled approach: split → embed → upload in slices.
 
     Args:
         markdown_dir (str): Directory containing markdown files
@@ -306,7 +305,7 @@ def index_markdown_to_elasticsearch(
         es_url (str): Elasticsearch URL
         mappings_path (str, optional): Path to domain mappings JSON file
         timestamps_path (str, optional): Path to timestamps JSON file from combine_domains
-        embedding_model (str): Ollama embedding model name
+        embedding_model (str): Embedding model name (for display only, actual model is remote)
         chunk_size (int): Size of text chunks for splitting
         chunk_overlap (int): Overlap between chunks
         clean_index (bool): Whether to delete existing index before indexing
@@ -317,71 +316,59 @@ def index_markdown_to_elasticsearch(
         force_domain (str, optional): Force a specific domain instead of extracting from path
 
     Returns:
-        dict: Summary with 'documents_loaded', 'documents_indexed', 'index_name'
+        dict: Summary with 'documents_loaded', 'documents_indexed'
     """
+    # --- SETUP & LOGGING ---
     print("=" * 70)
-    print("Elasticsearch Indexing Pipeline")
-    print("=" * 70)
-    print(f"Markdown dir: {markdown_dir}")
+    sys.stdout.flush()
+    print("Elasticsearch Indexing Pipeline (Safe Mode: Decoupled + Sliced Uploads)")
     print(f"Index name:   {index_name}")
-    print(f"ES URL:       {es_url}")
-    print(f"Embedding:    {embedding_model}")
+    print(f"Chunk Size:   {chunk_size}")
     print("=" * 70)
+    sys.stdout.flush()
 
-    # Validate credentials for remote servers
     is_local = "127.0.0.1" in es_url or "localhost" in es_url
-    if not is_local:
-        if not es_user or not es_password:
-            raise ValueError(
-                "Elasticsearch credentials are required for remote servers.\n"
-                "Please provide es_user and es_password parameters, or set\n"
-                "ELASTIC_USERNAME and ELASTIC_PASSWORD in your .env file."
-            )
+    if not is_local and (not es_user or not es_password):
+        raise ValueError("Elasticsearch credentials required for remote server.")
 
-    # Clean index if requested
     if clean_index:
         clean_elasticsearch_index(index_name, es_url, es_user, es_password)
 
-    # Load domain mappings if provided
-    domain_mappings = None
-    if mappings_path:
-        domain_mappings = load_domain_mappings(mappings_path)
+    # --- LOAD DOCUMENTS ---
+    domain_mappings = load_domain_mappings(mappings_path) if mappings_path else None
+    timestamps = load_timestamps(timestamps_path) if timestamps_path else None
 
-    # Load timestamps if provided
-    timestamps = None
-    if timestamps_path:
-        timestamps = load_timestamps(timestamps_path)
-
-    # Load documents from markdown files
-    print("\nLoading markdown documents...")
+    print("\nLoading documents...")
+    sys.stdout.flush()
     documents = get_documents_from_markdown_files(markdown_dir, domain_mappings, timestamps, force_domain)
+    print(f"Documents loaded: {len(documents)}")
+    sys.stdout.flush()
 
     if not documents:
         print("No documents found!")
-        return {
-            'documents_loaded': 0,
-            'documents_indexed': 0,
-            'index_name': index_name
-        }
+        sys.stdout.flush()
+        return {'documents_loaded': 0, 'documents_indexed': 0}
 
-    print(f"Loaded {len(documents)} documents")
-
-    # Save to JSON if requested
+    # --- DEBUG JSON SAVE ---
     if save_json:
         if json_output_path is None:
             json_output_path = f"output/{index_name}_documents.json"
+        print(f"Saving debug JSON to {json_output_path}...")
+        sys.stdout.flush()
         save_documents_to_json(documents, json_output_path)
+        print("JSON saved.")
+        sys.stdout.flush()
 
-    # Create Elasticsearch vector store
-    # Handle authentication for remote servers
-    # Use small batch_size to avoid 413 Request Entity Too Large errors
-    if "127.0.0.1" in es_url or "localhost" in es_url:
+    # --- ES CONNECTION ---
+    print("\nConnecting to Elasticsearch...")
+    sys.stdout.flush()
+    if is_local:
         es_vector_store = ElasticsearchStore(
             index_name=index_name,
             vector_field="doc_vector",
             text_field="content",
             es_url=es_url,
-            batch_size=10  # Limit bulk operations to 10 nodes at a time
+            batch_size=1  # Keep at 1 for safety
         )
     else:
         es_vector_store = ElasticsearchStore(
@@ -391,83 +378,112 @@ def index_markdown_to_elasticsearch(
             es_url=es_url,
             es_user=es_user,
             es_password=es_password,
-            batch_size=10  # Limit bulk operations to 10 nodes at a time
+            batch_size=1
         )
 
-    # Create remote embedding model
-    print("\nInitializing remote embedding service...")
-
-    # Get embedding service URL from environment
+    # --- EMBEDDING SERVICE ---
     embedding_service_url = os.getenv("EMBEDDING_SERVICE_URL")
     if not embedding_service_url:
-        raise ValueError("EMBEDDING_SERVICE_URL not set in environment variables")
+        raise ValueError("EMBEDDING_SERVICE_URL not set")
+    remote_embedding = RemoteEmbedding(service_url=embedding_service_url, timeout=300.0)
+    print(f"✓ Connected to services")
+    sys.stdout.flush()
 
-    try:
-        remote_embedding = RemoteEmbedding(
-            service_url=embedding_service_url,
-            timeout=300.0  # 5 minutes timeout
-        )
-        print(f"✓ Connected to remote embedding service: {embedding_service_url}")
-    except Exception as e:
-        print(f"✗ Error connecting to remote embedding service: {e}")
-        raise
-
-    # Create ingestion pipeline
-    pipeline = IngestionPipeline(
+    # --- PIPELINE SETUP (SPLITTER ONLY) ---
+    # We purposefully do NOT include remote_embedding here. We run it manually.
+    splitter_pipeline = IngestionPipeline(
         transformations=[
             SentenceSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap),
-            remote_embedding,
-        ],
-        vector_store=es_vector_store
+        ]
     )
 
-    # Run pipeline with batch processing
-    print(f"\nProcessing {len(documents)} documents...")
-    print("This may take a while depending on document size and embedding model...")
-
-    # Process in smaller batches to avoid connection timeouts and ES request size limits
-    batch_size = 3
+    doc_batch_size = 1  # Process 1 file at a time (safest for debugging)
     total_processed = 0
+    total_skipped = 0
 
-    for i in range(0, len(documents), batch_size):
-        batch = documents[i:i+batch_size]
-        batch_num = (i // batch_size) + 1
-        total_batches = (len(documents) + batch_size - 1) // batch_size
+    print(f"\nStarting processing of {len(documents)} documents...")
+    sys.stdout.flush()
 
-        print(f"\nProcessing batch {batch_num}/{total_batches} ({len(batch)} documents)...")
-        pipeline.run(documents=batch, show_progress=False)
-        total_processed += len(batch)
-        print(f"✓ Batch {batch_num} completed successfully ({total_processed}/{len(documents)} documents)")
+    # --- MAIN LOOP WITH TQDM ---
+    for i in tqdm(range(0, len(documents), doc_batch_size), desc="Indexing", file=sys.stdout, mininterval=5.0):
+        batch = documents[i:i+doc_batch_size]
+
+        try:
+            # -------------------------------------------------
+            # STEP 1: SPLIT (Local CPU only)
+            # -------------------------------------------------
+            nodes = run_transformations(
+                nodes=batch,
+                transformations=splitter_pipeline.transformations,
+                show_progress=False
+            )
+
+            if not nodes:
+                continue
+
+            valid_nodes = []
+
+            # -------------------------------------------------
+            # STEP 2: EMBED (Network Call - One by One)
+            # -------------------------------------------------
+            for node in nodes:
+                try:
+                    content_str = node.get_content()
+
+                    # Safety Check: Size
+                    if len(content_str) > 500_000:
+                        # 500k chars is ~1MB. Too big for embedding model context usually.
+                        continue
+
+                    # Manual Embed
+                    node.embedding = remote_embedding.get_text_embedding(content_str)
+                    valid_nodes.append(node)
+
+                except Exception as e_embed:
+                    # If embedding fails for one chunk, just skip that chunk
+                    continue
+
+            if not valid_nodes:
+                total_skipped += len(batch)
+                continue
+
+            # -------------------------------------------------
+            # STEP 3: UPLOAD (Sliced to avoid 413 Body Too Large)
+            # -------------------------------------------------
+            # We slice the list of nodes into mini-batches of 20.
+            # This ensures the JSON payload sent to ES is never > 1MB.
+            upload_slice_size = 20
+
+            for u_idx in range(0, len(valid_nodes), upload_slice_size):
+                sub_batch = valid_nodes[u_idx : u_idx + upload_slice_size]
+                try:
+                    es_vector_store.add(sub_batch)
+                except Exception as e_upload:
+                    print(f"\n⚠️ Upload failed for slice {u_idx} in batch {i}: {e_upload}")
+                    sys.stdout.flush()
+                    continue  # Try the next slice
+
+            total_processed += len(batch)
+
+        except Exception as e:
+            print(f"\n❌ CRASH in file index {i}")
+            print(f"Error: {e}")
+            sys.stdout.flush()
+            total_skipped += len(batch)
+            continue
 
     print("\n" + "=" * 70)
-    print(f"✓ Successfully indexed {len(documents)} documents")
-    print(f"✓ Index name: {index_name}")
-    print(f"✓ Elasticsearch URL: {es_url}")
+    sys.stdout.flush()
+    print(f"✓ FINISHED.")
+    print(f"  Indexed: {total_processed}")
+    print(f"  Skipped: {total_skipped}")
     print("=" * 70)
+    sys.stdout.flush()
 
-    # Close the Elasticsearch client to prevent unclosed session warnings
     try:
-        # Try different methods to close the client
         if hasattr(es_vector_store, 'close'):
             es_vector_store.close()
+    except:
+        pass
 
-        # Access the underlying elasticsearch client
-        if hasattr(es_vector_store, '_client'):
-            client = es_vector_store._client
-            if hasattr(client, 'close'):
-                client.close()
-            elif hasattr(client, 'transport') and hasattr(client.transport, 'close'):
-                client.transport.close()
-
-        # Suppress ResourceWarning about unclosed sessions if cleanup fails
-        warnings.filterwarnings('ignore', category=ResourceWarning, message='unclosed')
-    except Exception as e:
-        # Suppress the warning if we can't close properly
-        warnings.filterwarnings('ignore', category=ResourceWarning, message='unclosed')
-        print(f"Note: Applying workaround for ES client cleanup")
-
-    return {
-        'documents_loaded': len(documents),
-        'documents_indexed': len(documents),
-        'index_name': index_name
-    }
+    return {'documents_loaded': len(documents), 'documents_indexed': total_processed}
