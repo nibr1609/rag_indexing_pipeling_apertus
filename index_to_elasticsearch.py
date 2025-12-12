@@ -368,12 +368,14 @@ def index_markdown_to_elasticsearch(
 
     # Create Elasticsearch vector store
     # Handle authentication for remote servers
+    # Use small batch_size to avoid 413 Request Entity Too Large errors
     if "127.0.0.1" in es_url or "localhost" in es_url:
         es_vector_store = ElasticsearchStore(
             index_name=index_name,
             vector_field="doc_vector",
             text_field="content",
-            es_url=es_url
+            es_url=es_url,
+            batch_size=10  # Limit bulk operations to 10 nodes at a time
         )
     else:
         es_vector_store = ElasticsearchStore(
@@ -382,7 +384,8 @@ def index_markdown_to_elasticsearch(
             text_field="content",
             es_url=es_url,
             es_user=es_user,
-            es_password=es_password
+            es_password=es_password,
+            batch_size=10  # Limit bulk operations to 10 nodes at a time
         )
 
     # Create remote embedding model
@@ -416,8 +419,8 @@ def index_markdown_to_elasticsearch(
     print(f"\nProcessing {len(documents)} documents...")
     print("This may take a while depending on document size and embedding model...")
 
-    # Process in smaller batches to avoid connection timeouts
-    batch_size = 10
+    # Process in smaller batches to avoid connection timeouts and ES request size limits
+    batch_size = 3
     total_processed = 0
 
     for i in range(0, len(documents), batch_size):
