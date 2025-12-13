@@ -417,9 +417,6 @@ def index_markdown_to_elasticsearch(
     doc_batch_size = 1  # Process 1 file at a time (safest for debugging)
     total_processed = 0
     total_skipped = 0
-    total_chunks_too_large = 0
-    total_embed_failures = 0
-    total_upload_failures = 0
 
     print(f"\nStarting processing of {len(documents)} documents...")
     sys.stdout.flush()
@@ -427,8 +424,6 @@ def index_markdown_to_elasticsearch(
     # --- MAIN LOOP WITH TQDM ---
     for i in tqdm(range(0, len(documents), doc_batch_size), desc="Indexing", file=sys.stdout, mininterval=5.0):
         batch = documents[i:i+doc_batch_size]
-        doc_metadata = batch[0].metadata if batch else {}
-        doc_path = doc_metadata.get('file_path', 'unknown')
 
         try:
             # -------------------------------------------------
@@ -441,28 +436,20 @@ def index_markdown_to_elasticsearch(
             )
 
             if not nodes:
-                print(f"\n⚠️ No nodes after split for doc {i}: {doc_path}")
-                sys.stdout.flush()
-                total_skipped += len(batch)
                 continue
 
             valid_nodes = []
-            skipped_chunks_in_doc = 0
 
             # -------------------------------------------------
             # STEP 2: EMBED (Network Call - One by One)
             # -------------------------------------------------
-            for node_idx, node in enumerate(nodes):
+            for node in nodes:
                 try:
                     content_str = node.get_content()
-                    content_len = len(content_str)
 
                     # Safety Check: Size
-                    if content_len > 500_000:
-                        print(f"\n⚠️ Chunk {node_idx} too large ({content_len} chars) in doc {i}: {doc_path}")
-                        sys.stdout.flush()
-                        total_chunks_too_large += 1
-                        skipped_chunks_in_doc += 1
+                    if len(content_str) > 500_000:
+                        # 500k chars is ~1MB. Too big for embedding model context usually.
                         continue
 
                     # Manual Embed
@@ -470,22 +457,10 @@ def index_markdown_to_elasticsearch(
                     valid_nodes.append(node)
 
                 except Exception as e_embed:
-                    print(f"\n❌ EMBED FAILURE - Terminating to allow investigation")
-                    print(f"   Doc index: {i}")
-                    print(f"   Doc path: {doc_path}")
-                    print(f"   Chunk index: {node_idx}")
-                    print(f"   Content length: {len(content_str)} chars")
-                    print(f"   Error: {str(e_embed)}")
-                    print(f"\n   Content preview (first 500 chars):")
-                    print(f"   {content_str[:500]}")
-                    print(f"\n   Content preview (last 500 chars):")
-                    print(f"   {content_str[-500:]}")
-                    sys.stdout.flush()
-                    raise  # Terminate immediately
+                    # If embedding fails for one chunk, just skip that chunk
+                    continue
 
             if not valid_nodes:
-                print(f"\n⚠️ No valid nodes after embedding for doc {i}: {doc_path} (skipped {skipped_chunks_in_doc} chunks)")
-                sys.stdout.flush()
                 total_skipped += len(batch)
                 continue
 
@@ -498,43 +473,18 @@ def index_markdown_to_elasticsearch(
 
             for u_idx in range(0, len(valid_nodes), upload_slice_size):
                 sub_batch = valid_nodes[u_idx : u_idx + upload_slice_size]
-
-                # Calculate approximate size of this batch
-                batch_text_size = sum(len(n.get_content()) for n in sub_batch)
-                batch_embedding_size = sum(len(n.embedding) * 4 for n in sub_batch if hasattr(n, 'embedding') and n.embedding)  # 4 bytes per float
-                batch_total_size = batch_text_size + batch_embedding_size
-
                 try:
                     es_vector_store.add(sub_batch)
                 except Exception as e_upload:
-                    print(f"\n❌ UPLOAD FAILURE - Terminating to allow investigation")
-                    print(f"   Doc index: {i}")
-                    print(f"   Doc path: {doc_path}")
-                    print(f"   Slice: {u_idx}-{u_idx+len(sub_batch)}")
-                    print(f"   Batch size: {len(sub_batch)} nodes")
-                    print(f"   Approximate sizes:")
-                    print(f"     - Text: {batch_text_size:,} bytes")
-                    print(f"     - Embeddings: {batch_embedding_size:,} bytes")
-                    print(f"     - Total: {batch_total_size:,} bytes")
-                    print(f"   Error: {str(e_upload)}")
-                    print(f"\n   Node details in this batch:")
-                    for idx, node in enumerate(sub_batch):
-                        node_content = node.get_content()
-                        node_emb_len = len(node.embedding) if hasattr(node, 'embedding') and node.embedding else 0
-                        print(f"     Node {idx}: {len(node_content)} chars, {node_emb_len} embedding dims")
-                        print(f"       Preview: {node_content[:100]}...")
+                    print(f"\n⚠️ Upload failed for slice {u_idx} in batch {i}: {e_upload}")
                     sys.stdout.flush()
-                    raise  # Terminate immediately
+                    continue  # Try the next slice
 
             total_processed += len(batch)
 
         except Exception as e:
-            # Re-raise if it's one of our intentional terminations
-            if "FAILURE - Terminating" in str(e) or isinstance(e, (RuntimeError, KeyError)):
-                raise
-            # Otherwise log and continue
-            print(f"\n❌ UNEXPECTED CRASH in doc {i}: {doc_path}")
-            print(f"   Error: {str(e)}")
+            print(f"\n❌ CRASH in file index {i}")
+            print(f"Error: {e}")
             sys.stdout.flush()
             total_skipped += len(batch)
             continue
@@ -542,11 +492,8 @@ def index_markdown_to_elasticsearch(
     print("\n" + "=" * 70)
     sys.stdout.flush()
     print(f"✓ FINISHED.")
-    print(f"  Documents indexed: {total_processed}")
-    print(f"  Documents skipped: {total_skipped}")
-    print(f"  Chunks too large: {total_chunks_too_large}")
-    print(f"  Embedding failures: {total_embed_failures}")
-    print(f"  Upload failures: {total_upload_failures}")
+    print(f"  Indexed: {total_processed}")
+    print(f"  Skipped: {total_skipped}")
     print("=" * 70)
     sys.stdout.flush()
 
