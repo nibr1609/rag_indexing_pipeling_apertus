@@ -423,6 +423,8 @@ def index_markdown_to_elasticsearch(
 
     # --- MAIN LOOP WITH TQDM ---
     for i in tqdm(range(0, len(documents), doc_batch_size), desc="Indexing", file=sys.stdout, mininterval=5.0):
+        if i % 10 == 0:
+            print("At iteration " + str(i) + " skipped files: " + str(total_skipped))
         batch = documents[i:i+doc_batch_size]
 
         try:
@@ -457,10 +459,13 @@ def index_markdown_to_elasticsearch(
                     valid_nodes.append(node)
 
                 except Exception as e_embed:
+                    print("Embedding failed")
+                    print(f"error: {e}")
                     # If embedding fails for one chunk, just skip that chunk
                     continue
 
             if not valid_nodes:
+                print("not valid nodes")
                 total_skipped += len(batch)
                 continue
 
@@ -478,6 +483,8 @@ def index_markdown_to_elasticsearch(
                 except Exception as e_upload:
                     print(f"\n⚠️ Upload failed for slice {u_idx} in batch {i}: {e_upload}")
                     sys.stdout.flush()
+                    print("Upload failed")
+                    print(f"error: {e}")
                     continue  # Try the next slice
 
             total_processed += len(batch)
@@ -487,6 +494,8 @@ def index_markdown_to_elasticsearch(
             print(f"Error: {e}")
             sys.stdout.flush()
             total_skipped += len(batch)
+            print("crash in file")
+            print(f"error: {e}")
             continue
 
     print("\n" + "=" * 70)
