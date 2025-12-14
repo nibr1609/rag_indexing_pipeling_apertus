@@ -366,6 +366,22 @@ def index_markdown_to_elasticsearch(
         sys.stdout.flush()
         return {'documents_loaded': 0, 'documents_indexed': 0}
 
+    # 🔴 TEMPORARY QUICKFIX: Skip already processed docs and reverse order
+    # REMOVE THIS LATER!
+    SKIP_FIRST_N = 33263  # Already indexed
+    REVERSE_ORDER = True  # Process from end
+
+    if SKIP_FIRST_N > 0:
+        print(f"⚠️ QUICKFIX: Skipping first {SKIP_FIRST_N} documents")
+        documents = documents[SKIP_FIRST_N:]
+        print(f"Remaining documents: {len(documents)}")
+
+    if REVERSE_ORDER:
+        print(f"⚠️ QUICKFIX: Reversing document order")
+        documents = list(reversed(documents))
+
+    sys.stdout.flush()
+
     # --- DEBUG JSON SAVE ---
     if save_json:
         if json_output_path is None:
