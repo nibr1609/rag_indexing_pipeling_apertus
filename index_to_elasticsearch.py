@@ -2,6 +2,29 @@
 """
 Index markdown files to Elasticsearch with embeddings.
 Includes URL and retrieval date metadata from domain mappings.
+
+INCREMENTAL INDEXING:
+To avoid re-processing already indexed files, use the indexed_files_path parameter.
+The tracking file will be created automatically if not provided (default: output/{index_name}_indexed_files.json).
+
+Direct usage:
+    index_markdown_to_elasticsearch(
+        markdown_dir="output/markdown/19945",
+        indexed_files_path="/path/to/indexed_files.json",  # Optional
+        ...
+    )
+
+Via pipeline script:
+    python run_indexing_pipeline.py \\
+        --warc-input-dir ./data/warcs \\
+        --topics-excel-path ./topics.xlsx \\
+        --indexed-files-path /path/to/indexed_files.json  # Optional
+
+Via SLURM:
+    sbatch index.sbatch <warc_dir> <excel_path> [indexed_files_path]
+
+The tracking file stores relative paths of successfully indexed markdown files.
+On subsequent runs, files in the tracking list will be skipped with an 'already_indexed' counter.
 """
 
 import json
@@ -90,6 +113,52 @@ def load_timestamps(timestamps_path):
         return {}
 
 
+def load_indexed_files(indexed_files_path):
+    """
+    Load set of already indexed file paths from JSON file.
+
+    Args:
+        indexed_files_path (str): Path to indexed files tracking JSON file
+
+    Returns:
+        set: Set of file paths that have been successfully indexed
+    """
+    if not indexed_files_path or not Path(indexed_files_path).exists():
+        print(f"No indexed files tracking found at {indexed_files_path} (starting fresh)")
+        return set()
+
+    try:
+        with open(indexed_files_path, 'r', encoding='utf-8') as f:
+            indexed_files = json.load(f)
+        indexed_set = set(indexed_files)
+        print(f"Loaded {len(indexed_set)} already indexed files")
+        return indexed_set
+    except Exception as e:
+        print(f"Error loading indexed files: {e}")
+        return set()
+
+
+def save_indexed_files(indexed_files_set, indexed_files_path):
+    """
+    Save set of successfully indexed file paths to JSON file.
+
+    Args:
+        indexed_files_set (set): Set of file paths that have been successfully indexed
+        indexed_files_path (str): Path to save indexed files tracking JSON file
+    """
+    try:
+        indexed_list = sorted(list(indexed_files_set))
+        output_path = Path(indexed_files_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(indexed_files_path, 'w', encoding='utf-8') as f:
+            json.dump(indexed_list, f, indent=2, ensure_ascii=False)
+
+        print(f"Saved {len(indexed_list)} indexed files to {indexed_files_path}")
+    except Exception as e:
+        print(f"Error saving indexed files: {e}")
+
+
 def save_documents_to_json(documents, output_file="indexed_documents.json"):
     """
     Save documents to JSON file for inspection/backup.
@@ -153,7 +222,7 @@ def clean_elasticsearch_index(index_name, es_url="https://es.swissai.cscs.ch", u
         print(f"Warning: Error cleaning index: {e}")
 
 
-def get_documents_from_markdown_files(markdown_dir, domain_mappings=None, timestamps=None, force_domain=None, base_path=None):
+def get_documents_from_markdown_files(markdown_dir, domain_mappings=None, timestamps=None, force_domain=None, base_path=None, indexed_files=None):
     """
     Reads markdown files and returns list of LlamaIndex Documents.
     STRICTLY FILTERS: Any single line > 1000 characters is deleted.
@@ -164,25 +233,36 @@ def get_documents_from_markdown_files(markdown_dir, domain_mappings=None, timest
         timestamps (dict): Optional mapping of file paths to retrieval timestamps
         force_domain (str): Optional domain to use instead of extracting from path (useful for subdirectories)
         base_path (str): Optional base path to prepend to URLs (e.g., "staffnet/de" when indexing a subdirectory)
+        indexed_files (set): Optional set of already indexed file paths to skip
 
     Returns:
-        list: List of Document objects with metadata
+        tuple: (List of Document objects with metadata, already_indexed_count)
     """
     documents = []
     markdown_path = Path(markdown_dir)
 
     if not markdown_path.exists():
         print(f"Error: Directory {markdown_dir} does not exist")
-        return documents
+        return documents, 0
 
     md_files = list(markdown_path.rglob("*.md"))
     print(f"Found {len(md_files)} markdown files")
 
     # Counter for deleted lines to track how much "junk" we removed
     deleted_lines_count = 0
+    already_indexed_count = 0
 
     for md_file in tqdm(md_files, desc="Loading markdown files"):
         try:
+            # Get relative path first for checking against indexed files
+            relative_path = md_file.relative_to(markdown_path)
+            relative_path_str = str(relative_path)
+
+            # Check if this file was already indexed
+            if indexed_files and relative_path_str in indexed_files:
+                already_indexed_count += 1
+                continue
+
             with open(md_file, 'r', encoding='utf-8') as f:
                 raw_content = f.read()
 
@@ -203,9 +283,6 @@ def get_documents_from_markdown_files(markdown_dir, domain_mappings=None, timest
             if not content.strip():
                 continue
             # ---------------------------------------------------------
-
-            # Get relative path and metadata
-            relative_path = md_file.relative_to(markdown_path)
 
             # Extract domain (use force_domain if provided, otherwise first directory in path)
             if force_domain:
@@ -291,7 +368,9 @@ def get_documents_from_markdown_files(markdown_dir, domain_mappings=None, timest
             continue
 
     print(f"⚠️ Filtered out {deleted_lines_count} massive lines (>1000 chars) during loading.")
-    return documents
+    if already_indexed_count > 0:
+        print(f"ℹ️ Skipped {already_indexed_count} already indexed files")
+    return documents, already_indexed_count
 
 
 def index_markdown_to_elasticsearch(
@@ -309,7 +388,8 @@ def index_markdown_to_elasticsearch(
     es_user="lsaie-1",
     es_password=None,
     force_domain=None,
-    base_path=None
+    base_path=None,
+    indexed_files_path=None
 ):
     """
     Index markdown files to Elasticsearch with embeddings.
@@ -331,9 +411,10 @@ def index_markdown_to_elasticsearch(
         es_password (str, optional): Elasticsearch password
         force_domain (str, optional): Force a specific domain instead of extracting from path
         base_path (str, optional): Base path to prepend to URLs (e.g., "staffnet/de")
+        indexed_files_path (str, optional): Path to JSON file tracking already indexed files
 
     Returns:
-        dict: Summary with 'documents_loaded', 'documents_indexed'
+        dict: Summary with 'documents_loaded', 'documents_indexed', 'already_indexed'
     """
     # --- SETUP & LOGGING ---
     print("=" * 70)
@@ -351,20 +432,28 @@ def index_markdown_to_elasticsearch(
     if clean_index:
         clean_elasticsearch_index(index_name, es_url, es_user, es_password)
 
+    # --- LOAD INDEXED FILES TRACKING ---
+    if not indexed_files_path:
+        # Set default path if not provided
+        indexed_files_path = f"output/{index_name}_indexed_files.json"
+    indexed_files = load_indexed_files(indexed_files_path)
+
     # --- LOAD DOCUMENTS ---
     domain_mappings = load_domain_mappings(mappings_path) if mappings_path else None
     timestamps = load_timestamps(timestamps_path) if timestamps_path else None
 
     print("\nLoading documents...")
     sys.stdout.flush()
-    documents = get_documents_from_markdown_files(markdown_dir, domain_mappings, timestamps, force_domain, base_path)
+    documents, already_indexed = get_documents_from_markdown_files(
+        markdown_dir, domain_mappings, timestamps, force_domain, base_path, indexed_files
+    )
     print(f"Documents loaded: {len(documents)}")
     sys.stdout.flush()
 
     if not documents:
         print("No documents found!")
         sys.stdout.flush()
-        return {'documents_loaded': 0, 'documents_indexed': 0}
+        return {'documents_loaded': 0, 'documents_indexed': 0, 'already_indexed': already_indexed}
 
     # --- DEBUG JSON SAVE ---
     if save_json:
@@ -417,6 +506,11 @@ def index_markdown_to_elasticsearch(
     doc_batch_size = 5  # Process 5 files at a time for better speed
     total_processed = 0
     total_skipped = 0
+
+    # Track successfully indexed files
+    if indexed_files is None:
+        indexed_files = set()
+    newly_indexed_files = set()
 
     print(f"\nStarting processing of {len(documents)} documents...")
     sys.stdout.flush()
@@ -494,6 +588,12 @@ def index_markdown_to_elasticsearch(
                     sys.stdout.flush()
                     continue  # Try the next slice
 
+            # Track successfully indexed files from this batch
+            for doc in batch:
+                file_path = doc.metadata.get('file_path')
+                if file_path:
+                    newly_indexed_files.add(file_path)
+
             total_processed += len(batch)
 
         except Exception as e:
@@ -508,8 +608,14 @@ def index_markdown_to_elasticsearch(
     print(f"✓ FINISHED.")
     print(f"  Indexed: {total_processed}")
     print(f"  Skipped: {total_skipped}")
+    print(f"  Already indexed: {already_indexed}")
     print("=" * 70)
     sys.stdout.flush()
+
+    # Save the updated indexed files list
+    if indexed_files_path and newly_indexed_files:
+        all_indexed_files = indexed_files.union(newly_indexed_files)
+        save_indexed_files(all_indexed_files, indexed_files_path)
 
     try:
         if hasattr(es_vector_store, 'close'):
@@ -517,4 +623,8 @@ def index_markdown_to_elasticsearch(
     except:
         pass
 
-    return {'documents_loaded': len(documents), 'documents_indexed': total_processed}
+    return {
+        'documents_loaded': len(documents),
+        'documents_indexed': total_processed,
+        'already_indexed': already_indexed
+    }

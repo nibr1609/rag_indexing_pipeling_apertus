@@ -8,37 +8,52 @@
 #SBATCH --time=8:00:00
 #SBATCH --output=/iopsstor/scratch/cscs/%u/rag_project/logs/output_%j.out
 #SBATCH --error=/iopsstor/scratch/cscs/%u/rag_project/logs/output_%j.err
-#SBATCH --environment=indexing_pipeline 
+#SBATCH --environment=indexing_pipeline
 
 # Stop the script if a command fails
 set -eo pipefail
 
 # --- Argument Validation ---
 
-# Validate if both arguments are provided ($1 and $2)
+# Validate if both required arguments are provided ($1 and $2)
 if [ -z "$1" ] || [ -z "$2" ]; then
-    echo "Usage: sbatch run_pipeline.sbatch <warc_dir> <excel_path>"
+    echo "Usage: sbatch index.sbatch <warc_dir> <excel_path> [indexed_files_path]"
+    echo "  warc_dir: Path to WARC files directory"
+    echo "  excel_path: Path to topics Excel file"
+    echo "  indexed_files_path: (Optional) Path to track already indexed files"
     exit 1
 fi
 
 WARC_INPUT_DIR="$1"
-EXCEL_PATH="$2" # This variable now holds the path to your Excel file
+EXCEL_PATH="$2"
+INDEXED_FILES_PATH="$3"  # Optional third argument
 
 echo "[sbatch] running on $(hostname)"
 echo "[sbatch] SLURM_JOB_ID: $SLURM_JOB_ID"
 echo "[sbatch] Processing WARC directory: $WARC_INPUT_DIR"
 echo "[sbatch] Using filter Excel path: $EXCEL_PATH"
 
-PROJECT_DIR="$SLURM_SUBMIT_DIR" 
+if [ -n "$INDEXED_FILES_PATH" ]; then
+    echo "[sbatch] Using indexed files tracking: $INDEXED_FILES_PATH"
+fi
+
+PROJECT_DIR="$SLURM_SUBMIT_DIR"
 cd "$PROJECT_DIR"
 
 echo "[sbatch] Starting Python pipeline..."
 
-# --- Corrected Python Function Call ---
-# Pass both arguments to the Python script with their required flags
+# --- Python Function Call ---
+# Build command with optional indexed files path
 
-python run_indexing_pipeline.py \
-    --warc-input-dir "$WARC_INPUT_DIR" \
-    --topics-excel-path "$EXCEL_PATH"
+if [ -n "$INDEXED_FILES_PATH" ]; then
+    python run_indexing_pipeline.py \
+        --warc-input-dir "$WARC_INPUT_DIR" \
+        --topics-excel-path "$EXCEL_PATH" \
+        --indexed-files-path "$INDEXED_FILES_PATH"
+else
+    python run_indexing_pipeline.py \
+        --warc-input-dir "$WARC_INPUT_DIR" \
+        --topics-excel-path "$EXCEL_PATH"
+fi
 
 echo "[sbatch] Pipeline finished successfully"
