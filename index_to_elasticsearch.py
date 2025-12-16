@@ -554,9 +554,11 @@ def index_markdown_to_elasticsearch(
             for node in nodes:
                 content_str = node.get_content()
                 # Safety Check: Size
-                # Model has 2048 token limit. Rough estimate: 4 chars/token = ~8000 chars max
-                # Use 7000 chars to be safe (leaves room for ~1750 tokens)
-                if len(content_str) > 7300:
+                # Model has 2048 token limit for ENTIRE REQUEST (all texts combined)
+                # With sub_batch_size=3, each text can be max ~680 tokens (2048/3)
+                # Conservative estimate: ~3 chars/token → 2000 chars max per text
+                if len(content_str) > 2000:
+                    print("too large")
                     skipped_too_large += 1
                     continue
                 embeddable_nodes.append(node)
@@ -569,9 +571,10 @@ def index_markdown_to_elasticsearch(
             if embeddable_nodes:
                 try:
                     # Split into sub-batches for concurrent processing
-                    # Process 10 texts per request, with up to 5 concurrent requests
-                    sub_batch_size = 10
-                    max_concurrent = 5
+                    # Process 3 texts per request (conservative to avoid token limit)
+                    # With up to 10 concurrent requests for better parallelism
+                    sub_batch_size = 3
+                    max_concurrent = 10
 
                     async def embed_with_concurrency():
                         semaphore = asyncio.Semaphore(max_concurrent)
