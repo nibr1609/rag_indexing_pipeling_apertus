@@ -180,13 +180,14 @@ def simple_search(
             "ELASTIC_USERNAME and ELASTIC_PASSWORD in your .env file."
         )
 
-    # Connect to Elasticsearch vector store
+    # Connect to Elasticsearch vector store with timeout
     if is_local:
         es_vector_store = ElasticsearchStore(
             index_name=index_name,
             vector_field='doc_vector',
             text_field='content',
-            es_url=es_url
+            es_url=es_url,
+            timeout=60  # 60 seconds timeout
         )
     else:
         es_vector_store = ElasticsearchStore(
@@ -195,7 +196,8 @@ def simple_search(
             text_field='content',
             es_url=es_url,
             es_user=es_user,
-            es_password=es_password
+            es_password=es_password,
+            timeout=60  # 60 seconds timeout
         )
 
     # Create remote embedding model

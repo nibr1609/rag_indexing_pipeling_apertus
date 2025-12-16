@@ -21,6 +21,7 @@ from urllib.parse import urlparse, urlunparse
 from query_elasticsearch import simple_search
 from datetime import datetime
 import json
+import time
 
 # Load environment
 load_dotenv()
@@ -175,15 +176,27 @@ def evaluate_question(question, relevant_docs, es_config, top_k=100):
     }
 
     try:
-        # Query the system
-        search_results = simple_search(
-            query=question,
-            index_name=es_config['index_name'],
-            es_url=es_config['es_url'],
-            top_k=top_k,
-            es_user=es_config['es_user'],
-            es_password=es_config['es_password']
-        )
+        # Query the system with retry logic
+        max_retries = 3
+        retry_delay = 2  # seconds
+
+        for attempt in range(max_retries):
+            try:
+                search_results = simple_search(
+                    query=question,
+                    index_name=es_config['index_name'],
+                    es_url=es_config['es_url'],
+                    top_k=top_k,
+                    es_user=es_config['es_user'],
+                    es_password=es_config['es_password']
+                )
+                break  # Success, exit retry loop
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    print(f"    Retry {attempt + 1}/{max_retries - 1} after error: {e}")
+                    time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
+                else:
+                    raise  # Last attempt failed, propagate error
 
         result['retrieved_count'] = len(search_results)
         result['search_results'] = search_results  # Store for reuse
@@ -339,8 +352,11 @@ def main():
         results.append(result)
 
         # Print what we're looking for (complete URLs)
+        print(f"  Looking for ({len(relevant_docs)} URLs):")
         for doc_url in relevant_docs:
-            print(f"  Looking for: {doc_url}")
+            normalized = normalize_url(doc_url)
+            print(f"    - {doc_url}")
+            print(f"      (normalized: {normalized})")
 
         # Print URLs found in search results (reuse stored results)
         if result.get('retrieved_count', 0) > 0:
@@ -353,7 +369,9 @@ def main():
             if found_urls:
                 print(f"  Found URLs (top {len(found_urls[:5])}):")
                 for url in found_urls[:5]:  # Show first 5
+                    normalized = normalize_url(url)
                     print(f"    - {url}")
+                    print(f"      (normalized: {normalized})")
             else:
                 print(f"  Found URLs: (none)")
         else:
