@@ -385,6 +385,7 @@ def main():
         total_found_docs += len(result['found_docs'])
 
         print()
+        sys.stdout.flush()
 
     # Compute metrics
     accuracy = successful / len(questions_data) if questions_data else 0
