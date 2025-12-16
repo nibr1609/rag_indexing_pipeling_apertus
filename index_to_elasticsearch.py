@@ -112,6 +112,7 @@ def worker_process_batch(task_payload):
     embedding_service_url = os.getenv("EMBEDDING_SERVICE_URL")
     if not embedding_service_url:
         print(f"❌ [Worker Error] EMBEDDING_SERVICE_URL not set")
+        sys.stdout.flush()
         return [], len(file_paths)
     
     # Each process creates its OWN connection pool
@@ -131,6 +132,7 @@ def worker_process_batch(task_payload):
                 relative_path = f_path.relative_to(base_path_obj)
             except ValueError:
                 print(f"⚠️ [Skip] Path issue for {f_path.name}")
+                sys.stdout.flush()
                 skipped_count += 1
                 continue 
 
@@ -149,6 +151,7 @@ def worker_process_batch(task_payload):
                     raw = f.read()
             except Exception as e:
                 print(f"❌ [Read Error] {f_path.name}: {e}")
+                sys.stdout.flush()
                 skipped_count += 1
                 continue
 
@@ -233,6 +236,7 @@ def worker_process_batch(task_payload):
                 
                 if len(embeddings) != len(nodes):
                     print(f"❌ [Embed Error] {f_path.name}: Mismatch (nodes={len(nodes)}, embs={len(embeddings)})")
+                    sys.stdout.flush()
                     skipped_count += 1
                     continue 
 
@@ -245,11 +249,13 @@ def worker_process_batch(task_payload):
 
             except Exception as e:
                 print(f"❌ [Embed Fail] {f_path.name}: {e}")
+                sys.stdout.flush()
                 skipped_count += 1
                 continue
 
         except Exception as e:
             print(f"❌ [Unknown Error] {f_path_str}: {e}")
+            sys.stdout.flush()
             skipped_count += 1
             continue
 
