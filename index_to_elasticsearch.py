@@ -252,13 +252,6 @@ def get_documents_from_markdown_files(markdown_dir, domain_mappings=None, timest
     deleted_lines_count = 0
     already_indexed_count = 0
 
-    # Debug: Show sample of indexed files if present
-    if indexed_files and len(indexed_files) > 0:
-        sample_indexed = list(indexed_files)[:3]
-        print(f"Sample of indexed files to skip: {sample_indexed}")
-
-    debug_first_files = 0  # Counter for debug output
-
     for md_file in tqdm(md_files, desc="Loading markdown files"):
         try:
             # Get relative path first for checking against indexed files
@@ -274,11 +267,6 @@ def get_documents_from_markdown_files(markdown_dir, domain_mappings=None, timest
                 domain = relative_path.parts[0] if relative_path.parts else "unknown"
                 # Normal case: relative path already includes domain
                 tracking_key = relative_path_str
-
-            # Debug: Show tracking keys for first 3 files
-            if debug_first_files < 3:
-                print(f"Debug file {debug_first_files}: tracking_key='{tracking_key}', in_indexed={tracking_key in indexed_files if indexed_files else False}")
-                debug_first_files += 1
 
             # Check if this file was already indexed
             if indexed_files and tracking_key in indexed_files:
