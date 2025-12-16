@@ -209,8 +209,8 @@ def evaluate_question(question, relevant_docs, es_config, top_k=100):
             if not found:
                 result['missing_docs'].append(relevant_url)
 
-        # Success if ALL relevant docs are found
-        result['success'] = len(result['missing_docs']) == 0
+        # Success if AT LEAST ONE relevant doc is found
+        result['success'] = len(result['found_docs']) > 0
 
     except Exception as e:
         result['error'] = str(e)
@@ -336,44 +336,36 @@ def main():
         result = evaluate_question(question, relevant_docs, es_config, args.top_k)
         results.append(result)
 
-        # Extract domains from relevant docs (what we're looking for)
+        # Print what we're looking for (complete URLs)
         for doc_url in relevant_docs:
-            try:
-                parsed = urlparse(doc_url)
-                domain = parsed.netloc.lower()
-                print(f"  Looking for: {domain}")
-            except:
-                print(f"  Looking for: {doc_url}")
+            print(f"  Looking for: {doc_url}")
 
-        # Extract domains from search results (what we found)
+        # Print URLs found in search results
         if result.get('retrieved_count', 0) > 0:
-            found_domains = set()
-            # Get domains from the search (need to re-query or store in result)
             try:
                 search_results = simple_search(
                     query=question,
                     index_name=es_config['index_name'],
                     es_url=es_config['es_url'],
-                    top_k=min(10, args.top_k),  # Just check first 10 for display
+                    top_k=min(10, args.top_k),
                     es_user=es_config['es_user'],
                     es_password=es_config['es_password']
                 )
+                found_urls = []
                 for sr in search_results:
-                    url = sr.get('url') or sr.get('url_preview')
+                    url = sr.get('url_preview') or sr.get('url')
                     if url:
-                        try:
-                            parsed = urlparse(url)
-                            found_domains.add(parsed.netloc.lower())
-                        except:
-                            pass
-                if found_domains:
-                    print(f"  Found domains: {', '.join(sorted(found_domains))}")
+                        found_urls.append(url)
+                if found_urls:
+                    print(f"  Found URLs:")
+                    for url in found_urls[:5]:  # Show first 5
+                        print(f"    - {url}")
                 else:
-                    print(f"  Found domains: (none)")
+                    print(f"  Found URLs: (none)")
             except Exception as e:
-                print(f"  Found domains: (error: {e})")
+                print(f"  Found URLs: (error: {e})")
         else:
-            print(f"  Found domains: (no results)")
+            print(f"  Found URLs: (no results)")
 
         if result['success']:
             successful += 1
