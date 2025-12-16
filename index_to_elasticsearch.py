@@ -258,8 +258,18 @@ def get_documents_from_markdown_files(markdown_dir, domain_mappings=None, timest
             relative_path = md_file.relative_to(markdown_path)
             relative_path_str = str(relative_path)
 
+            # Extract domain (use force_domain if provided, otherwise first directory in path)
+            if force_domain:
+                domain = force_domain
+                # When force_domain is used, create tracking key with domain prefix
+                tracking_key = f"{domain}/{relative_path_str}"
+            else:
+                domain = relative_path.parts[0] if relative_path.parts else "unknown"
+                # Normal case: relative path already includes domain
+                tracking_key = relative_path_str
+
             # Check if this file was already indexed
-            if indexed_files and relative_path_str in indexed_files:
+            if indexed_files and tracking_key in indexed_files:
                 already_indexed_count += 1
                 continue
 
@@ -283,12 +293,6 @@ def get_documents_from_markdown_files(markdown_dir, domain_mappings=None, timest
             if not content.strip():
                 continue
             # ---------------------------------------------------------
-
-            # Extract domain (use force_domain if provided, otherwise first directory in path)
-            if force_domain:
-                domain = force_domain
-            else:
-                domain = relative_path.parts[0] if relative_path.parts else "unknown"
 
             # Get URL from mappings
             url = None
@@ -342,7 +346,7 @@ def get_documents_from_markdown_files(markdown_dir, domain_mappings=None, timest
                     break
 
             metadata = {
-                "file_path": str(relative_path),
+                "file_path": tracking_key,  # Use tracking_key for consistent identification
                 "file_name": md_file.name,
                 "domain": domain,
                 "title": title,
