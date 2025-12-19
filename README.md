@@ -2,16 +2,16 @@
 
 This repository provides a complete pipeline for processing ETH Zurich web archive files (WARC format), indexing them into Elasticsearch, and evaluating retrieval performance with advanced features like query expansion and reranking.
 
+**Note:** This guide focuses on running the system on the CSCS cluster using SLURM job submission.
+
 ## Features
 
 - **Data Processing Pipeline**
-
   - Extract HTML and PDF files from WARC archives
   - Combine domain-specific HTML files by timestamp
   - Convert HTML to Markdown format
 
 - **Indexing & Search**
-
   - Index documents to Elasticsearch with semantic embeddings
   - Semantic search with vector similarity
   - Query expansion for improved retrieval
@@ -29,40 +29,51 @@ This repository provides a complete pipeline for processing ETH Zurich web archi
 
 ## Prerequisites
 
-- [Mamba](https://mamba.readthedocs.io/) or [Conda](https://docs.conda.io/)
-- Access to an Elasticsearch instance
-- Access to an embedding service (or local Ollama)
+- Access to CSCS cluster (Alps/Daint)
+- Access to Elasticsearch instance (https://es.swissai.cscs.ch)
+- Access to embedding service
 - (Optional) Access to OpenAI-compatible API for query expansion
 
-## Installation
+## Setup on CSCS Cluster
 
-### 1. Clone this repository
+### Step 1: Build the Container
 
-### 2. Create the environment
-
-Using mamba (recommended for faster installation):
+The CSCS cluster requires a SquashFS container for running the pipeline. Build it from a compute node:
 
 ```bash
-mamba env create -f env.yml
-mamba activate rag
+# Request an interactive compute node
+srun --nodes=1 --time=01:00:00 --partition=normal --account=large-sc-2 --container-writable --pty bash
+
+# Navigate to your project directory
+cd /iopsstor/scratch/cscs/$USER/path/to/project/
+
+# Build the container image
+podman build -t ethz_cpu_rag:v1 .
+
+# Convert to SquashFS format for enroot
+enroot import -o ethz_cpu_rag.sqsh podman://ethz_cpu_rag:v1
+
+# Exit the interactive session
+exit
 ```
 
-Or using conda:
+### Step 2: Create Enroot Configuration
 
-```bash
-conda env create -f env.yml
-conda activate rag
+Create the configuration file `~/.edf/rag_env.toml`:
+
+```toml
+image = "/iopsstor/scratch/cscs/<your_username>/path/to/project/ethz_cpu_rag.sqsh"
+mounts = [
+    "/iopsstor/scratch/cscs/<your_username>:/iopsstor/scratch/cscs/<your_username>"
+]
+writable = true
 ```
 
-### 3. Configure environment variables
+Replace `<your_username>` with your CSCS username.
 
-Copy the example environment file:
+### Step 3: Configure Environment Variables
 
-```bash
-cp .env.example .env
-```
-
-Edit `.env` and configure your credentials:
+Create a `.env` file in your project directory:
 
 ```bash
 # Elasticsearch Configuration
@@ -81,35 +92,34 @@ QUERY_EXPANSION_MODEL=gpt-4
 ```
 
 **Required variables:**
-
 - `ELASTIC_USERNAME`: Your Elasticsearch username
 - `ELASTIC_PASSWORD`: Your Elasticsearch password
 - `EMBEDDING_SERVICE_URL`: URL for the embedding service
 
 **Optional variables:**
-
 - `QUERY_EXPANSION_API_KEY`: API key for query expansion (required if using `--use-query-expansion`)
 - `QUERY_EXPANSION_BASE_URL`: Base URL for OpenAI-compatible API
 - `QUERY_EXPANSION_MODEL`: Model to use for query expansion
 
+### Step 4: Create Log Directory
+
+```bash
+mkdir -p /iopsstor/scratch/cscs/$USER/rag_project/logs
+```
+
 ## Usage
+
+All operations are submitted as SLURM jobs using the provided `.sbatch` scripts.
 
 ### 1. Indexing Pipeline
 
-To process WARC files and index them to Elasticsearch:
-
-```bash
-python run_indexing_pipeline.py
-```
-
-Or on CSCS cluster:
+Process WARC files and index them to Elasticsearch:
 
 ```bash
 sbatch index.sbatch
 ```
 
 This will:
-
 1. Extract HTML and PDF files from WARC archives
 2. Combine HTML files by domain and timestamp
 3. Convert HTML to Markdown
@@ -118,124 +128,60 @@ This will:
 
 The pipeline processes files from `./data/ethz_websites_2022-2025_examples/` and outputs to `./output/`.
 
+**Monitor the job:**
+```bash
+# Check job status
+squeue -u $USER
+
+# View output logs
+tail -f /iopsstor/scratch/cscs/$USER/rag_project/logs/index_<job_id>.out
+
+# View error logs
+tail -f /iopsstor/scratch/cscs/$USER/rag_project/logs/index_<job_id>.err
+```
+
 ### 2. Querying Documents
 
-#### Basic Query (Local)
+Query the indexed documents using different strategies.
 
-```bash
-python -c "
-from query_elasticsearch import simple_search, print_search_results
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
-
-results = simple_search(
-    query='What is machine learning?',
-    index_name=os.getenv('INDEX_NAME'),
-    es_url=os.getenv('ES_URL'),
-    top_k=5,
-    es_user=os.getenv('ELASTIC_USERNAME'),
-    es_password=os.getenv('ELASTIC_PASSWORD')
-)
-
-print_search_results(results)
-"
-```
-
-#### Query with Options
-
-**With Query Expansion:**
-
-```bash
-python -c "
-from query_elasticsearch import simple_search, print_search_results
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
-
-results = simple_search(
-    query='What is machine learning?',
-    index_name=os.getenv('INDEX_NAME'),
-    es_url=os.getenv('ES_URL'),
-    top_k=10,
-    es_user=os.getenv('ELASTIC_USERNAME'),
-    es_password=os.getenv('ELASTIC_PASSWORD'),
-    use_query_expansion=True
-)
-
-print_search_results(results)
-"
-```
-
-**With Reranking:**
-
-```bash
-python -c "
-from query_elasticsearch import simple_search, print_search_results
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
-
-results = simple_search(
-    query='What is machine learning?',
-    index_name=os.getenv('INDEX_NAME'),
-    es_url=os.getenv('ES_URL'),
-    top_k=20,
-    es_user=os.getenv('ELASTIC_USERNAME'),
-    es_password=os.getenv('ELASTIC_PASSWORD'),
-    use_reranker=True
-)
-
-print_search_results(results)
-"
-```
-
-**Full Pipeline (Query Expansion + Reranking):**
-
-```bash
-python -c "
-from query_elasticsearch import simple_search, print_search_results
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
-
-results = simple_search(
-    query='What is machine learning?',
-    index_name=os.getenv('INDEX_NAME'),
-    es_url=os.getenv('ES_URL'),
-    top_k=20,
-    es_user=os.getenv('ELASTIC_USERNAME'),
-    es_password=os.getenv('ELASTIC_PASSWORD'),
-    use_query_expansion=True,
-    use_reranker=True
-)
-
-print_search_results(results)
-"
-```
-
-#### Query on CSCS Cluster
-
-**Basic query:**
+#### Basic Query
 
 ```bash
 sbatch query.sbatch "What is machine learning?" 10
 ```
 
-**With reranker:**
+Arguments:
+- First argument: Query string (in quotes)
+- Second argument: Number of results to retrieve (default: 5)
+
+#### Query with Reranking
 
 ```bash
 sbatch query.sbatch "What is machine learning?" 20 --use-reranker
 ```
 
-**With query expansion and reranker:**
+The reranker uses a cross-encoder model to improve result quality by rescoring the top-k results.
+
+#### Query with Query Expansion
+
+```bash
+sbatch query.sbatch "What is machine learning?" 20 --use-query-expansion
+```
+
+Query expansion uses an LLM to reformulate the query for better retrieval.
+
+#### Full Pipeline (Query Expansion + Reranking)
 
 ```bash
 sbatch query.sbatch "What is machine learning?" 20 --use-query-expansion --use-reranker
+```
+
+This runs the complete pipeline: expand query → retrieve → rerank with original query.
+
+**Monitor the job:**
+```bash
+# View output
+tail -f /iopsstor/scratch/cscs/$USER/rag_project/logs/query_<job_id>.out
 ```
 
 ### 3. Evaluating the RAG System
@@ -245,7 +191,6 @@ The evaluation system compares different retrieval strategies using a ground tru
 #### Prepare Evaluation Data
 
 Create an Excel file (e.g., `questions.xlsx`) with columns:
-
 - `question`: The query text
 - `relevant_doc_1`: URL of the first relevant document
 - `relevant_doc_2`: URL of the second relevant document (optional)
@@ -255,75 +200,62 @@ Example:
 |----------|---------------|----------------|
 | What is ETH Zurich's admission process? | https://ethz.ch/en/studies/registration-application.html | https://ethz.ch/en/studies/bachelor.html |
 
-#### Run Evaluation
+Place the file in your project directory or on the scratch filesystem.
 
-**Run all 4 scenarios (recommended):**
-
-```bash
-python evaluate_rag.py --excel questions.xlsx --all-scenarios
-```
-
-Or on CSCS cluster:
+#### Run All 4 Evaluation Scenarios (Recommended)
 
 ```bash
-sbatch evaluate.sbatch questions.xlsx --all-scenarios
+sbatch evaluate.sbatch /path/to/questions.xlsx --all-scenarios
 ```
 
 This evaluates:
-
 1. **Baseline retrieval** - Standard semantic search
 2. **Query expansion + retrieval** - Expanded queries for better recall
 3. **Retrieval + reranking** - Cross-encoder reranking of results
-4. **Query expansion + retrieval + reranking** - Full pipeline
+4. **Query expansion + retrieval + reranking** - Full pipeline (reranks with original query)
 
-**Run specific scenario:**
+The evaluation retrieves k=100 results and computes accuracy at k=1, 3, 5, 10, 25, 50, 100.
 
-Baseline only:
+#### Run Specific Scenarios
 
+**Baseline only:**
 ```bash
-python evaluate_rag.py --excel questions.xlsx
+sbatch evaluate.sbatch /path/to/questions.xlsx
 ```
 
-Query expansion only:
-
+**Query expansion only:**
 ```bash
-python evaluate_rag.py --excel questions.xlsx --use-query-expansion
+sbatch evaluate.sbatch /path/to/questions.xlsx --use-query-expansion
 ```
 
-Reranker only:
-
+**Reranker only:**
 ```bash
-python evaluate_rag.py --excel questions.xlsx --use-reranker
+sbatch evaluate.sbatch /path/to/questions.xlsx --use-reranker
 ```
 
-Full pipeline:
-
+**Full pipeline:**
 ```bash
-python evaluate_rag.py --excel questions.xlsx --use-query-expansion --use-reranker
+sbatch evaluate.sbatch /path/to/questions.xlsx --use-query-expansion --use-reranker
 ```
 
-#### Evaluation Options
-
+**Monitor the job:**
 ```bash
-python evaluate_rag.py \
-  --excel path/to/questions.xlsx \
-  --top-k 100 \                    # Number of results to retrieve (default: 100)
-  --rerank-top-k 100 \             # Number to keep after reranking (default: 100)
-  --all-scenarios \                # Run all 4 evaluation scenarios
-  --output results.json \          # Custom output file (optional)
-  --latex-output table.tex         # Custom LaTeX output (optional)
+# Check job status (evaluation can take 1-2 hours)
+squeue -u $USER
+
+# View progress in real-time
+tail -f /iopsstor/scratch/cscs/$USER/rag_project/logs/evaluate_<job_id>.out
 ```
 
 #### Understanding Evaluation Results
 
 The evaluation outputs:
 
-1. **Console output** - Progress and summary statistics
-2. **JSON file** - Detailed results for each question and scenario
-3. **LaTeX table** - Formatted accuracy table for papers
+1. **Console output** (in log files) - Progress and summary statistics
+2. **JSON file** (`output/rag_evaluation/rag_evaluation_*.json`) - Detailed results for each question and scenario
+3. **LaTeX table** (`output/evaluation/accuracy_table.tex`) - Formatted accuracy table for papers
 
 Example output:
-
 ```
 ======================================================================
 SCENARIO 1/4: Retrieval Only
@@ -355,15 +287,11 @@ Query Exp. + Retrieval:
 
 ### Modular Components
 
-The system is designed with modularity in mind:
-
 1. **query_elasticsearch.py** - Core search functionality
-
    - `Reranker` class - Cross-encoder reranking
    - `simple_search()` - Main search function with optional query expansion and reranking
 
 2. **query_expansion.py** - Query expansion using LLMs
-
    - Expands user queries for better retrieval
    - Configurable via environment variables
 
@@ -387,47 +315,34 @@ Results
 
 **Important:** In the full pipeline scenario (query expansion + reranking), the reranking step uses the **original query**, not the expanded query, for better semantic matching.
 
-## Running on CSCS Cluster
+## SLURM Configuration
 
-### Container Setup
+### Default Job Parameters
 
-The CSCS cluster requires a SquashFS container. Follow these steps:
-
-#### Step 1: Build the Container
-
-From a compute node:
+All sbatch scripts use these default settings:
 
 ```bash
-srun --nodes=1 --time=01:00:00 --partition=normal --account=large-sc-2 --container-writable --pty bash
-cd /iopsstor/scratch/cscs/$USER/path/to/project/
-podman build -t ethz_cpu_rag:v1 .
-enroot import -o ethz_cpu_rag.sqsh podman://ethz_cpu_rag:v1
-exit
+#SBATCH --account=large-sc-2
+#SBATCH --partition=normal
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=4
+#SBATCH --environment=indexing_pipeline
 ```
 
-#### Step 2: Create Enroot Configuration
+**Time limits:**
+- `index.sbatch`: 4 hours
+- `query.sbatch`: 30 minutes
+- `evaluate.sbatch`: 2 hours
 
-Create `~/.edf/rag_env.toml`:
+### Customizing Job Resources
 
-```toml
-image = "/iopsstor/scratch/cscs/<your_username>/path/to/project/ethz_cpu_rag.sqsh"
-mounts = [
-    "/iopsstor/scratch/cscs/<your_username>:/iopsstor/scratch/cscs/<your_username>"
-]
-writable = true
-```
-
-#### Step 3: Submit Jobs
+To modify resource allocation, edit the `#SBATCH` directives in the respective `.sbatch` files:
 
 ```bash
-# Indexing
-sbatch index.sbatch
-
-# Querying
-sbatch query.sbatch "your query" 10 --use-reranker
-
-# Evaluation
-sbatch evaluate.sbatch /path/to/questions.xlsx --all-scenarios
+#SBATCH --time=04:00:00        # Increase time limit
+#SBATCH --cpus-per-task=8      # Increase CPU cores
+#SBATCH --mem=32G              # Add memory limit
 ```
 
 ## Project Structure
@@ -454,108 +369,106 @@ ethz_webarchive/
 ├── index.sbatch                   # SLURM script for indexing
 ├── query.sbatch                   # SLURM script for queries
 ├── evaluate.sbatch                # SLURM script for evaluation
+├── Dockerfile                     # Container definition
 ├── env.yml                        # Mamba/Conda environment
 ├── requirements.txt               # Python dependencies
 ├── .env.example                   # Environment variables template
 └── README.md                      # This file
 ```
 
-## Advanced Usage
+## Troubleshooting
 
-### Custom Reranking Query
+### Container Build Failures
 
-You can specify a different query for reranking:
-
-```python
-from query_elasticsearch import simple_search
-
-results = simple_search(
-    query="expanded query for retrieval",
-    use_query_expansion=False,
-    use_reranker=True,
-    rerank_query="original user question",  # Use this for reranking
-    rerank_top_k=50
-)
-```
-
-### Programmatic Evaluation
-
-```python
-from evaluate_rag import evaluate_question, load_questions_from_excel
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
-
-es_config = {
-    'index_name': os.getenv('INDEX_NAME'),
-    'es_url': os.getenv('ES_URL'),
-    'es_user': os.getenv('ELASTIC_USERNAME'),
-    'es_password': os.getenv('ELASTIC_PASSWORD')
-}
-
-questions_data = load_questions_from_excel('questions.xlsx')
-
-for question, relevant_docs in questions_data:
-    result = evaluate_question(
-        question=question,
-        relevant_docs=relevant_docs,
-        es_config=es_config,
-        top_k=100,
-        use_query_expansion=True,
-        use_reranker=True,
-        rerank_query=question,  # Use original for reranking
-        rerank_top_k=100
-    )
-    print(f"Question: {question}")
-    print(f"Success: {result['success']}")
-    print(f"Found {len(result['found_docs'])}/{len(relevant_docs)} docs")
-```
-
-### Embedding service issues
-
-Verify the embedding service is accessible:
-
+If the container build fails, check:
 ```bash
-curl $EMBEDDING_SERVICE_URL/health
+# Verify podman is available
+podman --version
+
+# Check disk space
+df -h /iopsstor/scratch/cscs/$USER
 ```
 
-### Query expansion failures
+### Job Failures
 
-Ensure your API key is set correctly:
-
+Check the error logs:
 ```bash
-echo $QUERY_EXPANSION_API_KEY
+cat /iopsstor/scratch/cscs/$USER/rag_project/logs/<job_type>_<job_id>.err
 ```
 
-If query expansion fails, the system will automatically fall back to the original query.
+Common issues:
+- **Missing .env file**: Ensure `.env` is in the project directory with correct credentials
+- **Elasticsearch connection**: Verify `ES_URL`, `ELASTIC_USERNAME`, `ELASTIC_PASSWORD`
+- **Embedding service timeout**: Check `EMBEDDING_SERVICE_URL` is accessible from compute nodes
 
-### Reranker not available
+### Slow Evaluation Performance
 
-Install sentence-transformers:
+The system includes optimizations to prevent slowdowns:
+- Automatic cleanup of Elasticsearch connections
+- Thread limiting for OpenBLAS (set to 4 threads)
 
+If evaluation is still slow, reduce the dataset size or retrieve fewer results:
 ```bash
-pip install sentence-transformers
+# This modifies the evaluate.sbatch script to use --top-k 50
 ```
 
-### Memory issues during evaluation
+### Query Expansion Failures
 
-Reduce batch sizes or top_k values:
-
+If query expansion fails, the system automatically falls back to the original query. Check:
 ```bash
-python evaluate_rag.py --excel questions.xlsx --top-k 50 --rerank-top-k 25
+# Verify API key is set
+grep QUERY_EXPANSION_API_KEY .env
+
+# Test API connectivity (from compute node)
+curl -H "Authorization: Bearer $QUERY_EXPANSION_API_KEY" $QUERY_EXPANSION_BASE_URL/models
+```
+
+### Reranker Errors
+
+Ensure sentence-transformers is installed in the container. Rebuild if necessary:
+```bash
+# Check requirements.txt includes:
+# sentence-transformers>=2.2.0
 ```
 
 ## Performance Tips
 
-1. **Use query expansion** when queries are short or ambiguous
+1. **Use query expansion** when queries are short or ambiguous - improves recall
 2. **Use reranking** when you need high precision in top results
-3. **Adjust top_k** based on your use case (higher for recall, lower for speed)
-4. **Run evaluations on cluster** for faster processing with multiple questions
+3. **Adjust top_k** based on your use case:
+   - Higher values (100+) for better recall
+   - Lower values (10-20) for faster execution
+4. **Run evaluation with --all-scenarios** to compare all strategies in one job
 
-## Contributing
+## Monitoring Jobs
 
-Contributions are welcome! Please feel free to submit issues or pull requests.
+### Useful SLURM Commands
+
+```bash
+# List your running/pending jobs
+squeue -u $USER
+
+# Get detailed job info
+scontrol show job <job_id>
+
+# Cancel a job
+scancel <job_id>
+
+# View accounting info for completed jobs
+sacct -j <job_id> --format=JobID,JobName,Elapsed,State,ExitCode
+```
+
+### Log Files
+
+All job outputs are saved to:
+```
+/iopsstor/scratch/cscs/$USER/rag_project/logs/
+```
+
+File naming convention:
+- `index_<job_id>.out` / `index_<job_id>.err`
+- `query_<job_id>.out` / `query_<job_id>.err`
+- `evaluate_<job_id>.out` / `evaluate_<job_id>.err`
 
 ## License
 
