@@ -6,8 +6,10 @@ Returns relevant documents with metadata including URLs and retrieval dates.
 
 from llama_index.core import VectorStoreIndex
 from llama_index.vector_stores.elasticsearch import ElasticsearchStore
-from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.llms.ollama import Ollama
+from remote_embedding import RemoteEmbedding
+from query_expansion import expand_query
+import os
 
 # TODO
 
@@ -151,10 +153,11 @@ def simple_search(
     query,
     index_name="ethz_webarchive",
     es_url="https://es.swissai.cscs.ch",
-    embedding_model="nomic-embed-text",
     top_k=5,
     es_user=None,
-    es_password=None
+    es_password=None,
+    use_query_expansion=False,
+    query_expansion_verbose=False
 ):
     """
     Simple semantic search without LLM response generation.
@@ -164,14 +167,27 @@ def simple_search(
         query (str): Search query
         index_name (str): Name of Elasticsearch index
         es_url (str): Elasticsearch URL
-        embedding_model (str): Ollama embedding model name
         top_k (int): Number of results to return
         es_user (str, optional): Elasticsearch username (required for remote servers)
         es_password (str, optional): Elasticsearch password (required for remote servers)
+        use_query_expansion (bool): Whether to expand query before search (default: False)
+        query_expansion_verbose (bool): Whether to print query expansion details (default: False)
 
     Returns:
         list: List of dicts with document text and metadata
     """
+    # Expand query if requested
+    original_query = query
+    if use_query_expansion:
+        try:
+            query = expand_query(query, verbose=query_expansion_verbose)
+            if query_expansion_verbose:
+                print(f"\n[Query Expansion]")
+                print(f"  Original: {original_query}")
+                print(f"  Expanded: {query}")
+        except Exception as e:
+            print(f"Warning: Query expansion failed ({e}), using original query")
+            query = original_query
     # Validate credentials for remote servers
     is_local = "127.0.0.1" in es_url or "localhost" in es_url
     if not is_local and (not es_user or not es_password):
@@ -181,26 +197,48 @@ def simple_search(
             "ELASTIC_USERNAME and ELASTIC_PASSWORD in your .env file."
         )
 
-    # Connect to Elasticsearch vector store
+    # Connect to Elasticsearch vector store with extended timeout
+    # Configure client options with longer timeout for remote connections
+    from elasticsearch import AsyncElasticsearch
+
+    # Create ES client with proper timeout configuration
     if is_local:
+        es_client = AsyncElasticsearch(
+            hosts=[es_url],
+            request_timeout=120,  # 120 seconds for request timeout
+            max_retries=3,
+            retry_on_timeout=True
+        )
         es_vector_store = ElasticsearchStore(
             index_name=index_name,
             vector_field='doc_vector',
             text_field='content',
-            es_url=es_url
+            es_client=es_client
         )
     else:
+        es_client = AsyncElasticsearch(
+            hosts=[es_url],
+            basic_auth=(es_user, es_password),
+            request_timeout=120,  # 120 seconds for request timeout
+            max_retries=3,
+            retry_on_timeout=True
+        )
         es_vector_store = ElasticsearchStore(
             index_name=index_name,
             vector_field='doc_vector',
             text_field='content',
-            es_url=es_url,
-            es_user=es_user,
-            es_password=es_password
+            es_client=es_client
         )
 
-    # Create embedding model
-    embed_model = OllamaEmbedding(embedding_model)
+    # Create remote embedding model
+    embedding_service_url = os.getenv("EMBEDDING_SERVICE_URL")
+    if not embedding_service_url:
+        raise ValueError("EMBEDDING_SERVICE_URL not set in environment variables")
+
+    embed_model = RemoteEmbedding(
+        service_url=embedding_service_url,
+        timeout=300.0
+    )
 
     # Create index from vector store
     index = VectorStoreIndex.from_vector_store(
@@ -229,6 +267,12 @@ def simple_search(
             "file_path": node.metadata.get('file_path'),
         }
         results.append(result)
+
+    # Add metadata about query expansion to first result (if any)
+    if results and use_query_expansion:
+        results[0]['_query_expansion_used'] = True
+        results[0]['_original_query'] = original_query
+        results[0]['_expanded_query'] = query
 
     return results
 
