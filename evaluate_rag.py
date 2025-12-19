@@ -17,6 +17,12 @@ Usage:
 
 import os
 import sys
+
+# Set OpenBLAS threads to avoid warnings and resource contention
+os.environ['OPENBLAS_NUM_THREADS'] = '4'
+os.environ['OMP_NUM_THREADS'] = '4'
+os.environ['MKL_NUM_THREADS'] = '4'
+
 import argparse
 import pandas as pd
 from dotenv import load_dotenv
