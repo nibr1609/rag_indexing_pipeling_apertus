@@ -11,6 +11,63 @@ from remote_embedding import RemoteEmbedding
 from query_expansion import expand_query
 import os
 
+# Optional: Import reranker
+try:
+    from sentence_transformers import CrossEncoder
+    RERANKER_AVAILABLE = True
+except ImportError:
+    RERANKER_AVAILABLE = False
+
+# ----------------------------
+# RERANKER
+# ----------------------------
+class Reranker:
+    def __init__(self, model_name="cross-encoder/ms-marco-MiniLM-L-6-v2"):
+        if not RERANKER_AVAILABLE:
+            raise ImportError(
+                "sentence-transformers is required for reranking. "
+                "Install it with: pip install sentence-transformers"
+            )
+        self.model = CrossEncoder(model_name)
+
+    def rerank(self, query, docs, top_k=100):
+        """
+        Rerank documents using cross-encoder scores.
+
+        Args:
+            query: Search query string
+            docs: List of ES result dicts, must contain 'text' field
+            top_k: Number of top results to return after reranking
+
+        Returns:
+            List of reranked documents with 'rerank_score' field added
+        """
+        # Create query-document pairs for scoring
+        pairs = [(query, d.get("text", "")) for d in docs if d.get("text")]
+
+        if not pairs:
+            return docs[:top_k]
+
+        # Get reranking scores
+        scores = self.model.predict(pairs)
+
+        # Assign scores to documents
+        scored_docs = []
+        score_idx = 0
+        for d in docs:
+            if d.get("text"):
+                d["rerank_score"] = float(scores[score_idx])
+                score_idx += 1
+            else:
+                d["rerank_score"] = float("-inf")
+            scored_docs.append(d)
+
+        # Sort by rerank score (descending)
+        scored_docs.sort(key=lambda x: x["rerank_score"], reverse=True)
+
+        return scored_docs[:top_k]
+
+
 # TODO
 
 # def query_webarchive(
@@ -157,7 +214,10 @@ def simple_search(
     es_user=None,
     es_password=None,
     use_query_expansion=False,
-    query_expansion_verbose=False
+    query_expansion_verbose=False,
+    use_reranker=False,
+    rerank_query=None,
+    rerank_top_k=None
 ):
     """
     Simple semantic search without LLM response generation.
@@ -172,6 +232,9 @@ def simple_search(
         es_password (str, optional): Elasticsearch password (required for remote servers)
         use_query_expansion (bool): Whether to expand query before search (default: False)
         query_expansion_verbose (bool): Whether to print query expansion details (default: False)
+        use_reranker (bool): Whether to rerank results with cross-encoder (default: False)
+        rerank_query (str, optional): Query to use for reranking (defaults to original query if None)
+        rerank_top_k (int, optional): Number of results to keep after reranking (defaults to top_k if None)
 
     Returns:
         list: List of dicts with document text and metadata
@@ -267,6 +330,24 @@ def simple_search(
             "file_path": node.metadata.get('file_path'),
         }
         results.append(result)
+
+    # Rerank results if requested
+    if use_reranker:
+        if not RERANKER_AVAILABLE:
+            raise ImportError(
+                "sentence-transformers is required for reranking. "
+                "Install it with: pip install sentence-transformers"
+            )
+
+        # Use provided rerank_query, or fall back to original query
+        query_for_reranking = rerank_query if rerank_query is not None else original_query
+
+        # Use provided rerank_top_k, or fall back to top_k
+        final_rerank_top_k = rerank_top_k if rerank_top_k is not None else top_k
+
+        # Initialize reranker and rerank
+        reranker = Reranker()
+        results = reranker.rerank(query_for_reranking, results, top_k=final_rerank_top_k)
 
     # Add metadata about query expansion to first result (if any)
     if results and use_query_expansion:

@@ -15,13 +15,17 @@ set -eo pipefail
 
 # --- Argument Validation ---
 if [ -z "$1" ]; then
-    echo "Usage: sbatch evaluate.sbatch <excel_path> [--compare-query-expansion]"
+    echo "Usage: sbatch evaluate.sbatch <excel_path> [options]"
     echo "Example: sbatch evaluate.sbatch /path/to/questions.xlsx"
-    echo "Example: sbatch evaluate.sbatch /path/to/questions.xlsx --compare-query-expansion"
+    echo "Example: sbatch evaluate.sbatch /path/to/questions.xlsx --all-scenarios"
+    echo "Example: sbatch evaluate.sbatch /path/to/questions.xlsx --use-reranker"
     echo "Note: Always retrieves k=100 results and computes accuracy at k=1,3,5,10,25,50,100"
     echo ""
     echo "Options:"
-    echo "  --compare-query-expansion: Compare baseline retrieval with query expansion"
+    echo "  --all-scenarios: Run all 4 evaluation scenarios"
+    echo "  --use-query-expansion: Enable query expansion only"
+    echo "  --use-reranker: Enable reranker only"
+    echo "  --compare-query-expansion: (Deprecated) Use --all-scenarios instead"
     exit 1
 fi
 

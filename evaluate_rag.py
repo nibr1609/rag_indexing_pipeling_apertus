@@ -21,70 +21,13 @@ import argparse
 import pandas as pd
 from dotenv import load_dotenv
 from urllib.parse import urlparse, urlunparse
-from query_elasticsearch import simple_search
+from query_elasticsearch import simple_search, RERANKER_AVAILABLE
 from datetime import datetime
 import json
 import time
 
 # Load environment
 load_dotenv()
-
-# Optional: Import reranker (only if --use-reranker is specified)
-try:
-    from sentence_transformers import CrossEncoder
-    RERANKER_AVAILABLE = True
-except ImportError:
-    RERANKER_AVAILABLE = False
-
-
-# ----------------------------
-# RERANKER
-# ----------------------------
-class Reranker:
-    def __init__(self, model_name="cross-encoder/ms-marco-MiniLM-L-6-v2"):
-        if not RERANKER_AVAILABLE:
-            raise ImportError(
-                "sentence-transformers is required for reranking. "
-                "Install it with: pip install sentence-transformers"
-            )
-        self.model = CrossEncoder(model_name)
-
-    def rerank(self, query, docs, top_k=100):
-        """
-        Rerank documents using cross-encoder scores.
-        
-        Args:
-            query: Search query string
-            docs: List of ES result dicts, must contain 'text' field
-            top_k: Number of top results to return after reranking
-            
-        Returns:
-            List of reranked documents with 'rerank_score' field added
-        """
-        # Create query-document pairs for scoring
-        pairs = [(query, d.get("text", "")) for d in docs if d.get("text")]
-        
-        if not pairs:
-            return docs[:top_k]
-        
-        # Get reranking scores
-        scores = self.model.predict(pairs)
-        
-        # Assign scores to documents
-        scored_docs = []
-        score_idx = 0
-        for d in docs:
-            if d.get("text"):
-                d["rerank_score"] = float(scores[score_idx])
-                score_idx += 1
-            else:
-                d["rerank_score"] = float("-inf")
-            scored_docs.append(d)
-        
-        # Sort by rerank score (descending)
-        scored_docs.sort(key=lambda x: x["rerank_score"], reverse=True)
-        
-        return scored_docs[:top_k]
 
 
 # ----------------------------
@@ -219,21 +162,23 @@ def evaluate_question(
     es_config,
     top_k=100,
     use_query_expansion=False,
-    reranker=None,
+    use_reranker=False,
+    rerank_query=None,
     rerank_top_k=100
 ):
     """
     Evaluate a single question.
-    
+
     Args:
         question: The question to ask
         relevant_docs: List of relevant document URLs
         es_config: Elasticsearch configuration
         top_k: Number of results to retrieve
         use_query_expansion: Whether to use query expansion
-        reranker: Optional Reranker instance for reranking results
+        use_reranker: Whether to use reranker
+        rerank_query: Query to use for reranking (defaults to original question if None)
         rerank_top_k: Number of results to keep after reranking
-        
+
     Returns:
         dict: Evaluation results
     """
@@ -248,14 +193,14 @@ def evaluate_question(
         'all_ranks': [],
         'search_results': [],
         'query_expansion_used': use_query_expansion,
-        'reranker_used': reranker is not None
+        'reranker_used': use_reranker
     }
-    
+
     try:
         # Query the system with retry logic
         max_retries = 3
         retry_delay = 2  # seconds
-        
+
         for attempt in range(max_retries):
             try:
                 search_results = simple_search(
@@ -266,7 +211,10 @@ def evaluate_question(
                     es_user=es_config['es_user'],
                     es_password=es_config['es_password'],
                     use_query_expansion=use_query_expansion,
-                    query_expansion_verbose=False
+                    query_expansion_verbose=False,
+                    use_reranker=use_reranker,
+                    rerank_query=rerank_query,
+                    rerank_top_k=rerank_top_k
                 )
                 break  # Success, exit retry loop
             except Exception as e:
@@ -275,17 +223,7 @@ def evaluate_question(
                     time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
                 else:
                     raise  # Last attempt failed, propagate error
-        
-        # ----------------------------
-        # RERANKING (optional)
-        # ----------------------------
-        if reranker is not None:
-            search_results = reranker.rerank(
-                question,
-                search_results,
-                top_k=rerank_top_k
-            )
-        
+
         result['retrieved_count'] = len(search_results)
         result['search_results'] = search_results
         
@@ -450,7 +388,9 @@ def generate_latex_table(k_values, accuracies, output_path):
         
         # Data rows
         for row_name, acc_list in accuracies.items():
-            row = f"{row_name} & " + " & ".join([f"{acc:.1%}" for acc in acc_list]) + " \\\\\n"
+            # Format percentages and escape % character for LaTeX
+            formatted_accs = [f"{acc:.1%}".replace("%", "\\%") for acc in acc_list]
+            row = f"{row_name} & " + " & ".join(formatted_accs) + " \\\\\n"
             f.write(row)
         
         f.write("\\hline\n")
@@ -475,11 +415,13 @@ def main():
     parser.add_argument("--use-query-expansion", action="store_true",
                         help="Enable query expansion for improved retrieval")
     parser.add_argument("--compare-query-expansion", action="store_true",
-                        help="Compare retrieval with and without query expansion")
+                        help="Compare retrieval with and without query expansion (deprecated: use --all-scenarios)")
     parser.add_argument("--use-reranker", action="store_true",
                         help="Enable cross-encoder reranking")
     parser.add_argument("--rerank-top-k", type=int, default=100,
                         help="Number of results to keep after reranking (default: 100)")
+    parser.add_argument("--all-scenarios", action="store_true",
+                        help="Run all 4 evaluation scenarios (baseline, query exp, reranker, query exp + reranker)")
     
     args = parser.parse_args()
     
@@ -525,154 +467,118 @@ def main():
         print("No questions found with ethz.ch relevant docs!")
         return
     
-    # Initialize reranker if needed
-    reranker = Reranker() if args.use_reranker else None
-    
-    # Determine which evaluations to run
-    run_baseline = not args.use_query_expansion or args.compare_query_expansion
-    run_query_expansion = args.use_query_expansion or args.compare_query_expansion
-    
-    # Evaluate baseline (without query expansion)
-    results = []
-    if run_baseline:
+    # Define evaluation scenarios
+    # Each scenario is: (name, use_query_expansion, use_reranker, rerank_query_override)
+    # rerank_query_override: None means use the query as-is, "original" means use original question
+    all_4_scenarios = [
+        ("Retrieval Only", False, False, None),
+        ("Query Exp. + Retrieval", True, False, None),
+        ("Retrieval + Reranker", False, True, None),  # Uses original query for reranking
+        ("Query Exp. + Retrieval + Reranker", True, True, "original"),  # Rerank with original query!
+    ]
+
+    # Filter scenarios based on user flags
+    if args.all_scenarios or args.compare_query_expansion:
+        # Run all 4 scenarios
+        scenarios = all_4_scenarios
+    elif args.use_query_expansion and args.use_reranker:
+        # Only run query expansion + reranker scenario
+        scenarios = [("Query Exp. + Retrieval + Reranker", True, True, "original")]
+    elif args.use_query_expansion:
+        # Only run query expansion scenario
+        scenarios = [("Query Exp. + Retrieval", True, False, None)]
+    elif args.use_reranker:
+        # Only run reranker scenario
+        scenarios = [("Retrieval + Reranker", False, True, None)]
+    else:
+        # Default: run baseline only
+        scenarios = [("Retrieval Only", False, False, None)]
+
+    # Store results for each scenario
+    all_results = {}
+    all_metrics = {}
+
+    # Run each scenario
+    for scenario_idx, (scenario_name, use_qe, use_rr, rerank_override) in enumerate(scenarios):
+        print("\n" + "=" * 70)
+        print(f"SCENARIO {scenario_idx + 1}/{len(scenarios)}: {scenario_name}")
+        print("=" * 70)
+        print()
+
+        results = []
         successful = 0
         total_relevant_docs = 0
         total_found_docs = 0
-        
-        mode_desc = "with reranker" if args.use_reranker else "baseline retrieval"
-        print(f"Evaluating questions ({mode_desc})...")
-        print()
-        
+
         for i, (question, relevant_docs) in enumerate(questions_data, start=1):
             print(f"[{i}/{len(questions_data)}] {question[:80]}...")
-            
+
+            # Determine rerank_query parameter
+            # If rerank_override is "original", pass the original question
+            # Otherwise, pass None (will use query as-is in simple_search)
+            rerank_query_param = question if rerank_override == "original" else None
+
             result = evaluate_question(
                 question,
                 relevant_docs,
                 es_config,
                 args.top_k,
-                use_query_expansion=False,
-                reranker=reranker,
+                use_query_expansion=use_qe,
+                use_reranker=use_rr,
+                rerank_query=rerank_query_param,
                 rerank_top_k=args.rerank_top_k
             )
             results.append(result)
-            
-            # Print what we're looking for (complete URLs)
-            print(f"  Looking for ({len(relevant_docs)} URLs):")
-            for doc_url in relevant_docs:
-                normalized = normalize_url(doc_url)
-                print(f"    - {doc_url}")
-                print(f"      (normalized: {normalized})")
-            
-            # Print URLs found in search results (reuse stored results)
-            if result.get('retrieved_count', 0) > 0:
-                search_results = result.get('search_results', [])
-                found_urls = []
-                for sr in search_results[:10]:  # Show first 10
-                    url = sr.get('url_preview') or sr.get('url')
-                    if url:
-                        found_urls.append(url)
-                
-                if found_urls:
-                    print(f"  Found URLs (top {len(found_urls[:5])}):")
-                    for url in found_urls[:5]:  # Show first 5
-                        normalized = normalize_url(url)
-                        print(f"    - {url}")
-                        print(f"      (normalized: {normalized})")
-                else:
-                    print(f"  Found URLs: (none)")
-            else:
-                print(f"  Found URLs: (no results)")
-            
+
             if result['success']:
                 successful += 1
                 print(f"  ✓ SUCCESS")
             else:
                 print(f"  ✗ FAILURE")
-            
+
             total_relevant_docs += len(relevant_docs)
             total_found_docs += len(result['found_docs'])
             print()
             sys.stdout.flush()
-        
-        # Compute baseline metrics
+
+        # Compute metrics for this scenario
         accuracy = successful / len(questions_data) if questions_data else 0
         recall = total_found_docs / total_relevant_docs if total_relevant_docs > 0 else 0
-        first_match_ranks = [r['rank_of_first_match'] for r in results 
+        first_match_ranks = [r['rank_of_first_match'] for r in results
                             if r['rank_of_first_match'] is not None]
         avg_rank = sum(first_match_ranks) / len(first_match_ranks) if first_match_ranks else None
-    
-    # Evaluate with query expansion
-    results_with_qe = []
-    if run_query_expansion:
-        successful_qe = 0
-        total_relevant_docs_qe = 0
-        total_found_docs_qe = 0
-        
-        print("\n" + "=" * 70)
-        mode_desc = "with query expansion + reranker" if args.use_reranker else "with query expansion"
-        print(f"Evaluating questions ({mode_desc})...")
-        print("=" * 70)
-        print()
-        
-        for i, (question, relevant_docs) in enumerate(questions_data, start=1):
-            print(f"[{i}/{len(questions_data)}] {question[:80]}...")
-            
-            result = evaluate_question(
-                question,
-                relevant_docs,
-                es_config,
-                args.top_k,
-                use_query_expansion=True,
-                reranker=reranker,
-                rerank_top_k=args.rerank_top_k
-            )
-            results_with_qe.append(result)
-            
-            if result['success']:
-                successful_qe += 1
-                print(f"  ✓ SUCCESS")
-            else:
-                print(f"  ✗ FAILURE")
-            
-            total_relevant_docs_qe += len(relevant_docs)
-            total_found_docs_qe += len(result['found_docs'])
-            print()
-            sys.stdout.flush()
-        
-        # Compute query expansion metrics
-        accuracy_qe = successful_qe / len(questions_data) if questions_data else 0
-        recall_qe = total_found_docs_qe / total_relevant_docs_qe if total_relevant_docs_qe > 0 else 0
-        first_match_ranks_qe = [r['rank_of_first_match'] for r in results_with_qe 
-                               if r['rank_of_first_match'] is not None]
-        avg_rank_qe = sum(first_match_ranks_qe) / len(first_match_ranks_qe) if first_match_ranks_qe else None
+
+        # Store results
+        all_results[scenario_name] = results
+        all_metrics[scenario_name] = {
+            'successful': successful,
+            'failed': len(questions_data) - successful,
+            'accuracy': accuracy,
+            'recall': recall,
+            'avg_rank_first_match': avg_rank
+        }
     
     # Compute accuracy at different k values
     k_values = [1, 3, 5, 10, 25, 50, 100]
-    
+
     print("\n" + "=" * 70)
     print("ACCURACY AT DIFFERENT K VALUES")
     print("=" * 70)
-    
-    retrieval_accuracies = []
-    retrieval_accuracies_qe = []
-    
-    if run_baseline:
-        mode_label = "Baseline + Reranker" if args.use_reranker else "Baseline Retrieval"
-        print(f"\n{mode_label}:")
+
+    accuracies_dict = {}
+    for scenario_name, results in all_results.items():
+        print(f"\n{scenario_name}:")
+        scenario_accuracies = []
         for k in k_values:
             acc_at_k = compute_accuracy_at_k(results, k)
-            retrieval_accuracies.append(acc_at_k)
+            scenario_accuracies.append(acc_at_k)
             print(f"  Accuracy @ k={k:3d}: {acc_at_k:.2%}")
-    
-    if run_query_expansion:
-        mode_label = "Query Exp. + Reranker" if args.use_reranker else "With Query Expansion"
-        print(f"\n{mode_label}:")
-        for k in k_values:
-            acc_at_k = compute_accuracy_at_k(results_with_qe, k)
-            retrieval_accuracies_qe.append(acc_at_k)
-            print(f"  Accuracy @ k={k:3d}: {acc_at_k:.2%}")
-    
+        accuracies_dict[scenario_name] = scenario_accuracies
+        # Store in metrics dict
+        all_metrics[scenario_name]['accuracy_at_k'] = {
+            f'k_{k}': acc for k, acc in zip(k_values, scenario_accuracies)
+        }
+
     print("=" * 70)
     
     # Summary
@@ -680,95 +586,36 @@ def main():
     print("EVALUATION SUMMARY")
     print("=" * 70)
     print(f"Total questions: {len(questions_data)}")
-    
-    if run_baseline:
-        mode_label = "Baseline + Reranker" if args.use_reranker else "Baseline Retrieval"
-        print(f"\n{mode_label}:")
-        print(f"  Successful: {successful}")
-        print(f"  Failed: {len(questions_data) - successful}")
-        print(f"  Accuracy: {accuracy:.2%}")
-        print(f"  Recall: {recall:.2%}")
-        if avg_rank:
-            print(f"  Avg rank of first match: {avg_rank:.1f}")
-    
-    if run_query_expansion:
-        mode_label = "Query Exp. + Reranker" if args.use_reranker else "With Query Expansion"
-        print(f"\n{mode_label}:")
-        print(f"  Successful: {successful_qe}")
-        print(f"  Failed: {len(questions_data) - successful_qe}")
-        print(f"  Accuracy: {accuracy_qe:.2%}")
-        print(f"  Recall: {recall_qe:.2%}")
-        if avg_rank_qe:
-            print(f"  Avg rank of first match: {avg_rank_qe:.1f}")
-    
+
+    for scenario_name, metrics in all_metrics.items():
+        print(f"\n{scenario_name}:")
+        print(f"  Successful: {metrics['successful']}")
+        print(f"  Failed: {metrics['failed']}")
+        print(f"  Accuracy: {metrics['accuracy']:.2%}")
+        print(f"  Recall: {metrics['recall']:.2%}")
+        if metrics['avg_rank_first_match']:
+            print(f"  Avg rank of first match: {metrics['avg_rank_first_match']:.1f}")
+
     print("=" * 70)
-    
-    # Breakdown by success/failure (baseline)
-    if run_baseline:
-        print("\nBASELINE - SUCCESSFUL QUESTIONS:")
-        for result in results:
-            if result['success']:
-                print(f"  - {result['question'][:80]}")
-        
-        print("\nBASELINE - FAILED QUESTIONS:")
-        for result in results:
-            if not result['success']:
-                print(f"  - {result['question'][:80]}")
-                print(f"    Missing: {result['missing_docs']}")
     
     # Save detailed results
     if args.output:
         output_file = args.output
     else:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        mode_suffix = "_qe" if args.use_query_expansion and not args.compare_query_expansion else ""
-        mode_suffix = "_comparison" if args.compare_query_expansion else mode_suffix
-        if args.use_reranker:
-            mode_suffix += "_reranker"
+        if len(scenarios) == 4:
+            mode_suffix = "_all_scenarios"
+        elif len(scenarios) == 1:
+            mode_suffix = f"_{scenarios[0][0].lower().replace(' ', '_').replace('+', '').replace('.', '')}"
+        else:
+            mode_suffix = "_custom"
         output_file = f"output/rag_evaluation/rag_evaluation{mode_suffix}_{timestamp}.json"
-    
+
     # Generate LaTeX table
-    accuracies_dict = {}
-    if run_baseline:
-        label = "Retrieval + Reranker" if args.use_reranker else "Retrieval"
-        accuracies_dict[label] = retrieval_accuracies
-    if run_query_expansion:
-        label = "Query Exp. + Reranker" if args.use_reranker else "Query Exp. + Retrieval"
-        accuracies_dict[label] = retrieval_accuracies_qe
-    
     generate_latex_table(k_values, accuracies_dict, args.latex_output)
     print(f"\nLaTeX table saved to: {args.latex_output}")
-    
-    # Prepare metrics for JSON output
-    metrics_dict = {
-        'total_questions': len(questions_data),
-        'reranker_used': args.use_reranker
-    }
-    
-    if run_baseline:
-        metrics_dict['baseline'] = {
-            'successful': successful,
-            'failed': len(questions_data) - successful,
-            'accuracy': accuracy,
-            'recall': recall,
-            'avg_rank_first_match': avg_rank,
-            'accuracy_at_k': {
-                f'k_{k}': acc for k, acc in zip(k_values, retrieval_accuracies)
-            }
-        }
-    
-    if run_query_expansion:
-        metrics_dict['query_expansion'] = {
-            'successful': successful_qe,
-            'failed': len(questions_data) - successful_qe,
-            'accuracy': accuracy_qe,
-            'recall': recall_qe,
-            'avg_rank_first_match': avg_rank_qe,
-            'accuracy_at_k': {
-                f'k_{k}': acc for k, acc in zip(k_values, retrieval_accuracies_qe)
-            }
-        }
-    
+
+    # Prepare output data
     output_data = {
         'config': {
             'excel_file': args.excel,
@@ -777,14 +624,15 @@ def main():
             'use_query_expansion': args.use_query_expansion,
             'compare_query_expansion': args.compare_query_expansion,
             'use_reranker': args.use_reranker,
-            'rerank_top_k': args.rerank_top_k if args.use_reranker else None,
+            'rerank_top_k': args.rerank_top_k,
+            'scenarios_run': [name for name, _, _, _ in scenarios],
             'timestamp': datetime.now().isoformat()
         },
-        'metrics': metrics_dict,
-        'results': {
-            'baseline': results if run_baseline else [],
-            'query_expansion': results_with_qe if run_query_expansion else []
-        }
+        'metrics': {
+            'total_questions': len(questions_data),
+            'scenarios': all_metrics
+        },
+        'results': all_results
     }
     
     with open(output_file, 'w', encoding='utf-8') as f:
