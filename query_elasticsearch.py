@@ -263,6 +263,7 @@ def simple_search(
     # Connect to Elasticsearch vector store with extended timeout
     # Configure client options with longer timeout for remote connections
     from elasticsearch import AsyncElasticsearch
+    import asyncio
 
     # Create ES client with proper timeout configuration
     if is_local:
@@ -293,69 +294,74 @@ def simple_search(
             es_client=es_client
         )
 
-    # Create remote embedding model
-    embedding_service_url = os.getenv("EMBEDDING_SERVICE_URL")
-    if not embedding_service_url:
-        raise ValueError("EMBEDDING_SERVICE_URL not set in environment variables")
+    try:
+        # Create remote embedding model
+        embedding_service_url = os.getenv("EMBEDDING_SERVICE_URL")
+        if not embedding_service_url:
+            raise ValueError("EMBEDDING_SERVICE_URL not set in environment variables")
 
-    embed_model = RemoteEmbedding(
-        service_url=embedding_service_url,
-        timeout=300.0
-    )
+        embed_model = RemoteEmbedding(
+            service_url=embedding_service_url,
+            timeout=300.0
+        )
 
-    # Create index from vector store
-    index = VectorStoreIndex.from_vector_store(
-        vector_store=es_vector_store,
-        embed_model=embed_model
-    )
+        # Create index from vector store
+        index = VectorStoreIndex.from_vector_store(
+            vector_store=es_vector_store,
+            embed_model=embed_model
+        )
 
-    # Create retriever
-    retriever = index.as_retriever(similarity_top_k=top_k)
+        # Create retriever
+        retriever = index.as_retriever(similarity_top_k=top_k)
 
-    # Execute search
-    nodes = retriever.retrieve(query)
+        # Execute search
+        nodes = retriever.retrieve(query)
 
-    # Format results
-    results = []
-    for i, node in enumerate(nodes, 1):
-        result = {
-            "rank": i,
-            "score": node.score if hasattr(node, 'score') else None,
-            "text": node.text,
-            "url": node.metadata.get('url'),
-            "url_preview": node.metadata.get('url_preview'),
-            "retrieval_date": node.metadata.get('retrieval_date'),
-            "domain": node.metadata.get('domain'),
-            "title": node.metadata.get('title'),
-            "file_path": node.metadata.get('file_path'),
-        }
-        results.append(result)
+        # Format results
+        results = []
+        for i, node in enumerate(nodes, 1):
+            result = {
+                "rank": i,
+                "score": node.score if hasattr(node, 'score') else None,
+                "text": node.text,
+                "url": node.metadata.get('url'),
+                "url_preview": node.metadata.get('url_preview'),
+                "retrieval_date": node.metadata.get('retrieval_date'),
+                "domain": node.metadata.get('domain'),
+                "title": node.metadata.get('title'),
+                "file_path": node.metadata.get('file_path'),
+            }
+            results.append(result)
 
-    # Rerank results if requested
-    if use_reranker:
-        if not RERANKER_AVAILABLE:
-            raise ImportError(
-                "sentence-transformers is required for reranking. "
-                "Install it with: pip install sentence-transformers"
-            )
+        # Rerank results if requested
+        if use_reranker:
+            if not RERANKER_AVAILABLE:
+                raise ImportError(
+                    "sentence-transformers is required for reranking. "
+                    "Install it with: pip install sentence-transformers"
+                )
 
-        # Use provided rerank_query, or fall back to original query
-        query_for_reranking = rerank_query if rerank_query is not None else original_query
+            # Use provided rerank_query, or fall back to original query
+            query_for_reranking = rerank_query if rerank_query is not None else original_query
 
-        # Use provided rerank_top_k, or fall back to top_k
-        final_rerank_top_k = rerank_top_k if rerank_top_k is not None else top_k
+            # Use provided rerank_top_k, or fall back to top_k
+            final_rerank_top_k = rerank_top_k if rerank_top_k is not None else top_k
 
-        # Initialize reranker and rerank
-        reranker = Reranker()
-        results = reranker.rerank(query_for_reranking, results, top_k=final_rerank_top_k)
+            # Initialize reranker and rerank
+            reranker = Reranker()
+            results = reranker.rerank(query_for_reranking, results, top_k=final_rerank_top_k)
 
-    # Add metadata about query expansion to first result (if any)
-    if results and use_query_expansion:
-        results[0]['_query_expansion_used'] = True
-        results[0]['_original_query'] = original_query
-        results[0]['_expanded_query'] = query
+        # Add metadata about query expansion to first result (if any)
+        if results and use_query_expansion:
+            results[0]['_query_expansion_used'] = True
+            results[0]['_original_query'] = original_query
+            results[0]['_expanded_query'] = query
 
-    return results
+        return results
+
+    finally:
+        # Always close the ES client to prevent resource leaks
+        asyncio.get_event_loop().run_until_complete(es_client.close())
 
 
 def print_search_results(results):
