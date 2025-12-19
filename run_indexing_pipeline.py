@@ -5,7 +5,6 @@ from combine_domains import combine_domains_by_timestamp
 from html_combined_to_markdown import convert_html_combined_to_markdown
 from pdf_combined_to_markdown import convert_pdf_combined_to_markdown
 from index_to_elasticsearch import index_markdown_to_elasticsearch
-import shutil
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -29,21 +28,31 @@ def main():
         required=True
     )
 
+    parser.add_argument(
+        '--indexed-files-path',
+        required=False,
+        default=None,
+        help="Optional path to JSON file tracking already indexed files for incremental indexing."
+    )
+
     args = parser.parse_args()
     warc_input_dir = args.warc_input_dir
     topics_excel_path = args.topics_excel_path
+    indexed_files_path_arg = args.indexed_files_path
 
     # 4. Read Elasticsearch configuration from .env file
     es_username = os.getenv('ELASTIC_USERNAME')
     es_password = os.getenv('ELASTIC_PASSWORD')
     es_url = os.getenv('ES_URL', 'https://es.swissai.cscs.ch')
-    embedding_model = os.getenv('EMBEDDING_MODEL', 'all-minilm')
+    embedding_service_url = os.getenv('EMBEDDING_SERVICE_URL')
     index_name = os.getenv('INDEX_NAME', 'ethz_webarchive')
 
     if not es_username:
         raise ValueError("ELASTIC_USERNAME not found in environment variables. Please add it to your .env file")
     if not es_password:
         raise ValueError("ELASTIC_PASSWORD not found in environment variables. Please add it to your .env file")
+    if not embedding_service_url:
+        raise ValueError("EMBEDDING_SERVICE_URL not found in environment variables. Please add it to your .env file")
 
     # Define dynamic output paths based on collection ID
     output_base_dir = "output"
@@ -58,8 +67,11 @@ def main():
     html_mappings_path = os.path.join(mappings_base_dir, "domain_mappings.json")
     pdf_mappings_path = os.path.join(mappings_base_dir, "pdf_domain_mappings.json")
 
-    if os.path.exists(output_base_dir):
-        shutil.rmtree(output_base_dir)
+    # Use provided indexed files path or default
+    if indexed_files_path_arg:
+        indexed_files_path = indexed_files_path_arg
+    else:
+        indexed_files_path = os.path.join(output_base_dir, f"{index_name}_indexed_files.json")
 
     # Ensure necessary directories exist
     os.makedirs(mappings_base_dir, exist_ok=True)
@@ -130,16 +142,20 @@ def main():
     print("STAGE 3: Elasticsearch Indexing")
     print("=" * 70)
 
+    ethz = os.path.join(output_base_dir, "markdown", coll, "ethz.ch")
+
+
     index_markdown_to_elasticsearch(
-        clean_index=True,
+        clean_index=False,
         es_user=es_username,
         es_password=es_password,
         es_url=es_url,
-        embedding_model=embedding_model,
-        markdown_dir=markdown_output_dir,
+        markdown_dir=ethz,
         index_name=index_name,
         mappings_path=html_mappings_path,
-        timestamps_path=timestamps_json_path
+        timestamps_path=timestamps_json_path,
+        force_domain="ethz.ch",
+        indexed_files_path=indexed_files_path
     )
 
 

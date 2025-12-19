@@ -40,7 +40,7 @@ RUN pip install \
     llama-index-llms-openai==0.6.10 llama-index-readers-file==0.5.5 \
     llama-index-readers-llama-parse==0.5.1 llama-index-vector-stores-elasticsearch==0.5.1 \
     llama-index-workflows==2.11.5 llama-parse==0.6.54 marshmallow==3.26.1 mpmath==1.3.0 \
-    multidict==6.7.0 mypy_extensions==1.1.0 networkx==3.6 nltk==3.9.2 numpy==2.3.5 \
+    multidict==6.7.0 mypy_extensions==1.1.0 networkx==3.6 nltk==3.9.2 numpy==1.26.4 \
     ollama==0.6.1 openai==2.8.1 openpyxl==3.1.5 pandas==2.2.3 pillow==12.0.0 pluggy==1.6.0 \
     propcache==0.4.1 pydantic==2.12.5 pydantic_core==2.41.5 pypdf==6.4.0 pytest==9.0.1 \
     pytest-asyncio==1.3.0 python-dotenv==1.2.1 pytz==2025.2 regex==2025.11.3 \
