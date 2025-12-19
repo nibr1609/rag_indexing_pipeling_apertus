@@ -52,6 +52,19 @@ cd "$PROJECT_DIR"
 
 echo "[sbatch] Starting query..."
 
+# Convert bash booleans to Python booleans
+if [ "$USE_RERANKER" = "true" ]; then
+    PYTHON_USE_RERANKER="True"
+else
+    PYTHON_USE_RERANKER="False"
+fi
+
+if [ "$USE_QUERY_EXPANSION" = "true" ]; then
+    PYTHON_USE_QUERY_EXPANSION="True"
+else
+    PYTHON_USE_QUERY_EXPANSION="False"
+fi
+
 # Run the query
 python3 -c "
 from query_elasticsearch import simple_search, print_search_results
@@ -72,8 +85,8 @@ results = simple_search(
     top_k=${TOP_K},
     es_user=os.getenv('ELASTIC_USERNAME'),
     es_password=os.getenv('ELASTIC_PASSWORD'),
-    use_reranker=${USE_RERANKER},
-    use_query_expansion=${USE_QUERY_EXPANSION}
+    use_reranker=${PYTHON_USE_RERANKER},
+    use_query_expansion=${PYTHON_USE_QUERY_EXPANSION}
 )
 
 print_search_results(results)
